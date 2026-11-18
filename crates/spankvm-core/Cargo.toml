@@ -1,0 +1,10 @@
+[package]
+name = "spankvm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+spankvm-proto = { path = "../spankvm-proto" }
+serde.workspace = true
+thiserror.workspace = true

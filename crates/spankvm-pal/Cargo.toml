@@ -1,0 +1,31 @@
+[package]
+name = "spankvm-pal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+spankvm-proto = { path = "../spankvm-proto" }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"
+core-foundation = "0.10"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_UI_Input",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_DataExchange",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.10", default-features = false, features = ["tokio"] }
+reis = { version = "0.4", features = ["tokio"] }
+evdev = "0.12"
+x11rb = { version = "0.13", features = ["xinput", "xtest"] }
+nix = { version = "0.29", features = ["fs", "ioctl"] }

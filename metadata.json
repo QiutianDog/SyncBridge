@@ -1,0 +1,6 @@
+{
+  "name": "SpanKVM — 跨系统键鼠共享与多屏协同方案原型",
+  "description": "基于 Rust 架构设计的跨平台（macOS / Windows / Linux）一套键鼠控多屏、剪贴板与拖拽文件传输、局域网临时密钥配对软件样式原型与设计方案。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

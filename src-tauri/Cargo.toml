@@ -1,0 +1,26 @@
+[package]
+name = "spankvm-tauri"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SpanKVM Tauri v2 desktop daemon and cross-platform KVM control center"
+
+[lib]
+name = "spankvm_tauri_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+spankvm-proto = { path = "../crates/spankvm-proto" }
+spankvm-core = { path = "../crates/spankvm-core" }
+spankvm-pal = { path = "../crates/spankvm-pal" }
+spankvm-net = { path = "../crates/spankvm-net" }
+tauri = { version = "2", features = ["tray-icon"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+blake3.workspace = true
