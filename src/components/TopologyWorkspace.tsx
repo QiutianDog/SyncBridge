@@ -11,19 +11,20 @@ import {
   MousePointer,
   Keyboard,
   Plus,
-  LayoutGrid,
+  ShieldAlert,
+  Pause,
+  Play,
   RotateCcw,
 } from 'lucide-react';
 import {
   DeviceNode,
   GRID_COLS,
   GRID_ROWS,
+  LocalSystemStatus,
   MAX_DEVICES,
   VirtualCursorState,
   computeNeighbors,
   getOsLabel,
-  KeyMappingRule,
-  resolveMappedKey,
 } from '../utils/kvmEngine';
 
 interface TopologyWorkspaceProps {
@@ -38,19 +39,18 @@ interface TopologyWorkspaceProps {
   ) => Promise<{ ok: boolean; error?: string; swappedWith?: string }>;
   onUpdateNodeRefreshRate: (nodeId: string, hz: DeviceNode['refreshRateHz']) => void;
   cursor: VirtualCursorState;
-  onStepCursor: (dx: number, dy: number) => void;
   onJumpCursorToNode: (nodeId: string) => void;
   onEmergencyReturnPrimary: () => void;
   daemonActive: boolean;
   onToggleDaemonActive: () => void;
-  onLoadNinePreset: () => void;
-  onResetDefaultPreset: () => void;
   onNavigateToPairing: () => void;
   hidPollingHz: 500 | 1000;
   onChangeHidPollingHz: (hz: 500 | 1000) => void;
   edgeDelayMs: number;
   onChangeEdgeDelayMs: (ms: number) => void;
-  keyRules: KeyMappingRule[];
+  releaseHotkey: string;
+  systemStatus: LocalSystemStatus;
+  onRequestInputPermission: () => void;
 }
 
 export const TopologyWorkspace: React.FC<TopologyWorkspaceProps> = ({
@@ -61,26 +61,24 @@ export const TopologyWorkspace: React.FC<TopologyWorkspaceProps> = ({
   onMoveNode,
   onUpdateNodeRefreshRate,
   cursor,
-  onStepCursor,
   onJumpCursorToNode,
   onEmergencyReturnPrimary,
   daemonActive,
   onToggleDaemonActive,
-  onLoadNinePreset,
-  onResetDefaultPreset,
   onNavigateToPairing,
   hidPollingHz,
   onChangeHidPollingHz,
   edgeDelayMs,
   onChangeEdgeDelayMs,
-  keyRules,
+  releaseHotkey,
+  systemStatus,
+  onRequestInputPermission,
 }) => {
   const [topologyFeedback, setTopologyFeedback] = useState<{
     tone: 'info' | 'error';
     message: string;
   } | null>(null);
   const [draggedNodeId, setDraggedNodeId] = useState<string | null>(null);
-  const [lastSimKey, setLastSimKey] = useState<string>('Command (⌘)');
 
   const selectedNode = nodes.find((n) => n.id === selectedNodeId) ?? nodes[0];
   const activeFocusNode = nodes.find((n) => n.id === cursor.activeNodeId) ?? nodes[0];
@@ -94,12 +92,12 @@ export const TopologyWorkspace: React.FC<TopologyWorkspaceProps> = ({
     } else if (res.swappedWith) {
       setTopologyFeedback({
         tone: 'info',
-        message: `已将屏幕与「${res.swappedWith}」互换上下左右相对位置（已持久化保存）。`,
+        message: `已将屏幕与「${res.swappedWith}」互换上下左右相对位置，并同步至跨屏路由核心。`,
       });
     } else {
       setTopologyFeedback({
         tone: 'info',
-        message: `屏幕位置已更新至网格 (${col + 1}, ${row + 1})，边缘跨屏路由已实时同步至守护核心。`,
+        message: `屏幕位置已更新至网格 (${col + 1}, ${row + 1})，边缘跨屏路由已实时生效。`,
       });
     }
   };
@@ -110,53 +108,89 @@ export const TopologyWorkspace: React.FC<TopologyWorkspaceProps> = ({
     return <Server className="w-4 h-4 text-slate-600 dark:text-slate-300 shrink-0" />;
   };
 
-  const mappedPreview = activeFocusNode
-    ? resolveMappedKey(keyRules, lastSimKey, activeFocusNode.os)
-    : { outputKey: lastSimKey };
-
   return (
     <div className="space-y-6">
-      {/* Section Header & Quick Topology Presets */}
+      {/* OS Input Capture Permission Alert Banner (shown only when OS permission is missing) */}
+      {!systemStatus.inputPermissionGranted && (
+        <div
+          role="alert"
+          className="px-4 py-3 rounded-xl border border-amber-200 dark:border-amber-900 bg-amber-50/80 dark:bg-amber-950/30 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+        >
+          <div className="flex items-start gap-2.5 text-xs text-amber-900 dark:text-amber-200">
+            <ShieldAlert className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+            <div>
+              <span className="font-semibold">尚未授予系统全局键鼠控制权限：</span>
+              <span>
+                请在系统设置「隐私与安全性 → 辅助功能」中允许 SpanKVM 控制电脑，授权后即可捕获物理键鼠并跨屏幕控制其他主机。
+              </span>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onRequestInputPermission}
+            className="px-3.5 py-1.5 text-xs font-medium rounded-lg bg-amber-700 text-white hover:bg-amber-800 transition-colors whitespace-nowrap shrink-0"
+          >
+            前往系统权限设置
+          </button>
+        </div>
+      )}
+
+      {/* Section Header & Core Controls */}
       <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4 pb-5 border-b border-slate-200 dark:border-slate-800">
         <div>
           <h1 className="text-xl font-semibold tracking-tight text-slate-900 dark:text-slate-100">
-            多屏幕空间拓扑与主屏幕编排
+            多屏幕空间拓扑与跨屏焦点控制
           </h1>
           <p className="text-sm text-slate-600 dark:text-slate-400 mt-1">
-            配置物理键鼠所在的主屏幕及最多 {MAX_DEVICES} 台电脑的上下左右相邻关系；鼠标跨越屏幕边界时，键盘控制权自动同步切换。
+            编排物理键鼠所在的主屏幕及最多 {MAX_DEVICES} 台电脑的上下左右相邻关系；鼠标滑过屏幕边界时，键盘控制权自动同步切换。
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2.5 shrink-0">
           <button
             type="button"
+            onClick={onToggleDaemonActive}
+            className={`inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 ${
+              daemonActive
+                ? 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800'
+                : 'border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 text-amber-800 dark:text-amber-300'
+            }`}
+          >
+            {daemonActive ? (
+              <>
+                <Pause className="w-3.5 h-3.5" />
+                <span>暂停跨屏共享</span>
+              </>
+            ) : (
+              <>
+                <Play className="w-3.5 h-3.5" />
+                <span>恢复跨屏共享</span>
+              </>
+            )}
+          </button>
+
+          <button
+            type="button"
             onClick={() => {
-              onResetDefaultPreset();
-              setTopologyFeedback({ tone: 'info', message: '已切换为默认 4 台跨系统（macOS / Windows / Linux）拓扑。' });
+              onEmergencyReturnPrimary();
+              setTopologyFeedback({
+                tone: 'info',
+                message: '已强制释放远端修饰键并将键鼠焦点收回主屏幕中心。',
+              });
             }}
             className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
           >
             <RotateCcw className="w-3.5 h-3.5" />
-            默认 4 屏布局
+            <span>收回本机焦点</span>
           </button>
-          <button
-            type="button"
-            onClick={() => {
-              onLoadNinePreset();
-              setTopologyFeedback({ tone: 'info', message: '已载入 3×3 满载 9 台主机互联拓扑演示。' });
-            }}
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
-          >
-            <LayoutGrid className="w-3.5 h-3.5" />
-            演示 9 台上限九宫格
-          </button>
+
           <button
             type="button"
             onClick={onNavigateToPairing}
             className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors whitespace-nowrap shrink-0"
           >
             <Plus className="w-3.5 h-3.5" />
-            配对接入新电脑 ({nodes.length}/{MAX_DEVICES})
+            <span>配对接入新电脑 ({nodes.length}/{MAX_DEVICES})</span>
           </button>
         </div>
       </div>
@@ -164,7 +198,7 @@ export const TopologyWorkspace: React.FC<TopologyWorkspaceProps> = ({
       {topologyFeedback && (
         <div
           role="status"
-          className={`px-4 py-2.5 rounded-lg border text-sm flex items-center justify-between gap-4 ${
+          className={`px-4 py-2.5 rounded-lg border text-xs flex items-center justify-between gap-4 ${
             topologyFeedback.tone === 'error'
               ? 'bg-red-50/80 dark:bg-red-950/30 border-red-200 dark:border-red-900 text-red-800 dark:text-red-200'
               : 'bg-blue-50/70 dark:bg-blue-950/30 border-blue-200 dark:border-blue-900 text-slate-800 dark:text-slate-200'
@@ -174,7 +208,7 @@ export const TopologyWorkspace: React.FC<TopologyWorkspaceProps> = ({
           <button
             type="button"
             onClick={() => setTopologyFeedback(null)}
-            className="text-xs text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200 whitespace-nowrap shrink-0"
+            className="text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200 whitespace-nowrap shrink-0"
           >
             关闭提示
           </button>
@@ -191,14 +225,14 @@ export const TopologyWorkspace: React.FC<TopologyWorkspaceProps> = ({
           <div className="flex flex-wrap items-center justify-between gap-3 pb-4 mb-4 border-b border-slate-100 dark:border-slate-800/80">
             <div>
               <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
-                屏幕排列画布（拖拽屏幕或点击相邻网格调整上下左右关系）
+                屏幕排列画布（拖拽屏幕卡片或点击相邻槽位调整上下左右关系）
               </h2>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 tabular-nums">
-                当前互联：{nodes.length} / {MAX_DEVICES} 台 · 物理主屏幕：{primaryNode?.name ?? '未指定'} · 鼠标与键盘当前焦点：{activeFocusNode?.name ?? '无'}
+                已配置节点：{nodes.length} / {MAX_DEVICES} 台 · 主屏幕：{primaryNode?.name ?? '未指定'} · 当前键鼠焦点：{activeFocusNode?.name ?? '无'}
               </p>
             </div>
             <div className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
-              5×5 吸附矩阵 · 强制正交连通校验
+              5×5 正交连通拓扑
             </div>
           </div>
 
@@ -207,119 +241,132 @@ export const TopologyWorkspace: React.FC<TopologyWorkspaceProps> = ({
               className="grid grid-cols-5 gap-2.5 select-none min-w-[540px]"
               data-testid="topology-grid"
             >
-            {Array.from({ length: GRID_ROWS }).map((_, row) =>
-              Array.from({ length: GRID_COLS }).map((__, col) => {
-                const occupant = nodes.find(
-                  (n) => n.gridPos.col === col && n.gridPos.row === row
-                );
-                const isSelected = occupant?.id === selectedNode?.id;
-                const isCursorHere = occupant?.id === cursor.activeNodeId;
+              {Array.from({ length: GRID_ROWS }).map((_, row) =>
+                Array.from({ length: GRID_COLS }).map((__, col) => {
+                  const occupant = nodes.find(
+                    (n) => n.gridPos.col === col && n.gridPos.row === row
+                  );
+                  const isSelected = occupant?.id === selectedNode?.id;
+                  const isCursorHere = occupant?.id === cursor.activeNodeId;
+                  const isLocalMachine = occupant?.id === systemStatus.localNodeId;
 
-                if (occupant) {
+                  if (occupant) {
+                    return (
+                      <div
+                        key={`${col}-${row}`}
+                        draggable
+                        onDragStart={() => {
+                          setDraggedNodeId(occupant.id);
+                          onSelectNode(occupant.id);
+                        }}
+                        onDragOver={(e) => e.preventDefault()}
+                        onDrop={(e) => {
+                          e.preventDefault();
+                          if (draggedNodeId && draggedNodeId !== occupant.id) {
+                            handleCellAction(draggedNodeId, col, row);
+                          }
+                          setDraggedNodeId(null);
+                        }}
+                        className={`relative rounded-lg border p-2.5 transition-colors flex flex-col justify-between min-h-[122px] ${
+                          isSelected
+                            ? 'border-blue-600 dark:border-blue-500 bg-blue-50/50 dark:bg-blue-950/30'
+                            : 'border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-950/50 hover:border-slate-300 dark:hover:border-slate-700'
+                        }`}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => onSelectNode(occupant.id)}
+                          aria-label={`选择屏幕 ${occupant.name} (${getOsLabel(occupant.os)})`}
+                          className="text-left w-full flex-1 flex flex-col justify-between focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-600 rounded"
+                        >
+                          <div>
+                            <div className="flex items-center justify-between gap-1 text-[11px] leading-tight mb-1">
+                              <span
+                                className={
+                                  occupant.isPrimary
+                                    ? 'font-semibold text-blue-700 dark:text-blue-400'
+                                    : 'text-slate-500 dark:text-slate-400'
+                                }
+                              >
+                                {occupant.isPrimary
+                                  ? '主屏幕'
+                                  : isLocalMachine
+                                    ? '本机屏幕'
+                                    : '受控屏幕'}
+                                {' · '}
+                                <span
+                                  className={
+                                    occupant.online
+                                      ? 'text-emerald-700 dark:text-emerald-400'
+                                      : 'text-slate-400 dark:text-slate-500'
+                                  }
+                                >
+                                  {occupant.online ? '在线' : '离线'}
+                                </span>
+                              </span>
+                              {occupant.isPrimary && (
+                                <Crown className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400 shrink-0" />
+                              )}
+                            </div>
+
+                            <div className="flex items-center gap-1.5">
+                              {renderOsIcon(occupant.os)}
+                              <span className="text-xs font-semibold text-slate-900 dark:text-slate-100 truncate">
+                                {occupant.name}
+                              </span>
+                            </div>
+                          </div>
+
+                          <div className="mt-2 pt-2 border-t border-slate-200/70 dark:border-slate-800 space-y-0.5">
+                            <div className="text-[11px] text-slate-500 dark:text-slate-400 truncate tabular-nums">
+                              {getOsLabel(occupant.os)} · {occupant.refreshRateHz}Hz
+                            </div>
+                            <div className="text-[11px] font-mono text-slate-500 dark:text-slate-400 truncate tabular-nums">
+                              {occupant.ip}
+                            </div>
+                          </div>
+                        </button>
+
+                        {isCursorHere && (
+                          <div className="mt-1.5 pt-1 border-t border-blue-200 dark:border-blue-900 flex items-center gap-1 text-[11px] font-medium text-blue-700 dark:text-blue-300">
+                            <MousePointer className="w-3 h-3 shrink-0" />
+                            <span className="truncate">当前键鼠焦点</span>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  }
+
                   return (
-                    <div
+                    <button
                       key={`${col}-${row}`}
-                      draggable
-                      onDragStart={() => {
-                        setDraggedNodeId(occupant.id);
-                        onSelectNode(occupant.id);
-                      }}
+                      type="button"
                       onDragOver={(e) => e.preventDefault()}
                       onDrop={(e) => {
                         e.preventDefault();
-                        if (draggedNodeId && draggedNodeId !== occupant.id) {
+                        if (draggedNodeId) {
                           handleCellAction(draggedNodeId, col, row);
+                          setDraggedNodeId(null);
                         }
-                        setDraggedNodeId(null);
                       }}
-                      className={`relative rounded-lg border p-2.5 transition-colors flex flex-col justify-between min-h-[118px] ${
-                        isSelected
-                          ? 'border-blue-600 dark:border-blue-500 bg-blue-50/50 dark:bg-blue-950/30'
-                          : 'border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-950/50 hover:border-slate-300 dark:hover:border-slate-700'
-                      }`}
+                      onClick={() => {
+                        if (selectedNode) {
+                          handleCellAction(selectedNode.id, col, row);
+                        }
+                      }}
+                      aria-label={`将选中屏幕移动至网格第 ${row + 1} 行第 ${col + 1} 列`}
+                      className="rounded-lg border border-dashed border-slate-200 dark:border-slate-800/90 hover:border-blue-400 dark:hover:border-blue-600 hover:bg-blue-50/30 dark:hover:bg-blue-950/20 min-h-[122px] p-2 flex flex-col items-center justify-center text-center transition-colors group focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-600"
                     >
-                      <button
-                        type="button"
-                        onClick={() => onSelectNode(occupant.id)}
-                        aria-label={`选择屏幕 ${occupant.name} (${getOsLabel(occupant.os)})`}
-                        className="text-left w-full flex-1 flex flex-col justify-between focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-600 rounded"
-                      >
-                        <div>
-                          <div className="flex items-center justify-between gap-1 text-[11px] leading-tight mb-1">
-                            <span
-                              className={
-                                occupant.isPrimary
-                                  ? 'font-semibold text-blue-700 dark:text-blue-400'
-                                  : 'text-slate-500 dark:text-slate-400'
-                              }
-                            >
-                              {occupant.isPrimary ? '主屏幕 · 宿主' : '受控屏幕'}
-                            </span>
-                            {occupant.isPrimary && (
-                              <Crown className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400 shrink-0" />
-                            )}
-                          </div>
-
-                          <div className="flex items-center gap-1.5">
-                            {renderOsIcon(occupant.os)}
-                            <span className="text-xs font-semibold text-slate-900 dark:text-slate-100 truncate">
-                              {occupant.name}
-                            </span>
-                          </div>
-                        </div>
-
-                        <div className="mt-2 pt-2 border-t border-slate-200/70 dark:border-slate-800 space-y-0.5">
-                          <div className="text-[11px] text-slate-500 dark:text-slate-400 truncate tabular-nums">
-                            {getOsLabel(occupant.os)} · {occupant.refreshRateHz}Hz
-                          </div>
-                          <div className="text-[11px] font-mono text-slate-500 dark:text-slate-400 truncate tabular-nums">
-                            {occupant.ip}
-                          </div>
-                        </div>
-                      </button>
-
-                      {/* Active Mouse & Keyboard Focus Bar */}
-                      {isCursorHere && (
-                        <div className="mt-1.5 pt-1 border-t border-blue-200 dark:border-blue-900 flex items-center gap-1 text-[11px] font-medium text-blue-700 dark:text-blue-300">
-                          <MousePointer className="w-3 h-3 shrink-0" />
-                          <span className="truncate">当前键鼠焦点</span>
-                        </div>
-                      )}
-                    </div>
+                      <span className="text-[11px] font-mono text-slate-400 dark:text-slate-600 group-hover:text-blue-600 dark:group-hover:text-blue-400 tabular-nums">
+                        ({col + 1}, {row + 1})
+                      </span>
+                      <span className="text-[11px] text-slate-400 dark:text-slate-600 group-hover:text-blue-600 dark:group-hover:text-blue-400 mt-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                        移至此槽位
+                      </span>
+                    </button>
                   );
-                }
-
-                // Empty Grid Cell: Click to move selected screen here or drop dragged screen
-                return (
-                  <button
-                    key={`${col}-${row}`}
-                    type="button"
-                    onDragOver={(e) => e.preventDefault()}
-                    onDrop={(e) => {
-                      e.preventDefault();
-                      if (draggedNodeId) {
-                        handleCellAction(draggedNodeId, col, row);
-                        setDraggedNodeId(null);
-                      }
-                    }}
-                    onClick={() => {
-                      if (selectedNode) {
-                        handleCellAction(selectedNode.id, col, row);
-                      }
-                    }}
-                    aria-label={`将选中屏幕移动至网格第 ${row + 1} 行第 ${col + 1} 列`}
-                    className="rounded-lg border border-dashed border-slate-200 dark:border-slate-800/90 hover:border-blue-400 dark:hover:border-blue-600 hover:bg-blue-50/30 dark:hover:bg-blue-950/20 min-h-[118px] p-2 flex flex-col items-center justify-center text-center transition-colors group focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-600"
-                  >
-                    <span className="text-[11px] font-mono text-slate-400 dark:text-slate-600 group-hover:text-blue-600 dark:group-hover:text-blue-400 tabular-nums">
-                      ({col + 1}, {row + 1})
-                    </span>
-                    <span className="text-[11px] text-slate-400 dark:text-slate-600 group-hover:text-blue-600 dark:group-hover:text-blue-400 mt-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                      移至此槽位
-                    </span>
-                  </button>
-                );
-              })
-            )}
+                })
+              )}
             </div>
           </div>
         </section>
@@ -332,14 +379,17 @@ export const TopologyWorkspace: React.FC<TopologyWorkspaceProps> = ({
           {selectedNode && (
             <>
               <div className="p-5">
-                <div className="text-xs text-slate-500 dark:text-slate-400">
-                  当前选中配置节点 · 坐标 ({selectedNode.gridPos.col + 1}, {selectedNode.gridPos.row + 1})
+                <div className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+                  选中屏幕节点 · 网格坐标 ({selectedNode.gridPos.col + 1}, {selectedNode.gridPos.row + 1})
                 </div>
                 <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100 mt-1">
                   {selectedNode.name}
                 </h3>
                 <div className="text-xs text-slate-500 dark:text-slate-400 mt-1 tabular-nums">
-                  {getOsLabel(selectedNode.os)} · {selectedNode.resolution.width}×{selectedNode.resolution.height} · 延迟 {selectedNode.latencyMs.toFixed(1)} ms
+                  {getOsLabel(selectedNode.os)} · {selectedNode.resolution.width}×{selectedNode.resolution.height} ·{' '}
+                  {selectedNode.online
+                    ? `延迟 ${selectedNode.latencyMs.toFixed(1)} ms`
+                    : '等待设备上线'}
                 </div>
 
                 <div className="mt-4 flex flex-wrap gap-2">
@@ -365,11 +415,12 @@ export const TopologyWorkspace: React.FC<TopologyWorkspaceProps> = ({
 
                   <button
                     type="button"
+                    disabled={!selectedNode.online}
                     onClick={() => onJumpCursorToNode(selectedNode.id)}
-                    className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
+                    className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 transition-colors whitespace-nowrap shrink-0"
                   >
                     <MousePointer className="w-3.5 h-3.5" />
-                    移入键鼠焦点
+                    切入键鼠焦点
                   </button>
                 </div>
               </div>
@@ -380,7 +431,7 @@ export const TopologyWorkspace: React.FC<TopologyWorkspaceProps> = ({
                   <h4 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
                     上下左右相邻跨屏关系
                   </h4>
-                  <span className="text-xs text-slate-500 dark:text-slate-400">微调位置</span>
+                  <span className="text-xs text-slate-500 dark:text-slate-400">方向调整</span>
                 </div>
 
                 <div className="space-y-2 text-xs">
@@ -433,7 +484,7 @@ export const TopologyWorkspace: React.FC<TopologyWorkspaceProps> = ({
                     htmlFor="node-refresh-select"
                     className="block text-xs text-slate-600 dark:text-slate-400"
                   >
-                    当前显示器刷新率同步档位（光标插值帧率对齐）
+                    当前显示器刷新率档位（光标插值对齐）
                   </label>
                   <select
                     id="node-refresh-select"
@@ -457,7 +508,7 @@ export const TopologyWorkspace: React.FC<TopologyWorkspaceProps> = ({
                 <div className="grid grid-cols-2 gap-3">
                   <div>
                     <span className="block text-xs text-slate-600 dark:text-slate-400 mb-1.5">
-                      Raw HID 采样回报率
+                      鼠标采样回报率
                     </span>
                     <div className="flex p-0.5 rounded-lg bg-slate-100 dark:bg-slate-800">
                       {([500, 1000] as const).map((hz) => (
@@ -502,124 +553,43 @@ export const TopologyWorkspace: React.FC<TopologyWorkspaceProps> = ({
         </aside>
       </div>
 
-      {/* Interactive Cross-Screen Mouse & Keyboard Focus Follow Simulator */}
+      {/* Live Focus & Hotkey Summary Strip */}
       <section
-        aria-label="跨屏鼠标移动与键盘焦点跟随实时验证台"
+        aria-label="当前跨屏路由与键盘跟随状态"
         className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5"
       >
-        <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 pb-4 border-b border-slate-100 dark:border-slate-800">
-          <div>
-            <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
-              跨屏焦点跟随实时模拟器（鼠标在哪个屏幕，键盘控制就在哪个屏幕）
-            </h2>
-            <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              点击方向键推动虚拟鼠标跨越屏幕边缘，观察键盘焦点自动接管目标主机并实时应用对应系统的按键映射。
-            </p>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              onClick={onToggleDaemonActive}
-              className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 ${
-                daemonActive
-                  ? 'border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300'
-                  : 'border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 text-amber-800 dark:text-amber-300'
-              }`}
-            >
-              {daemonActive ? '跨屏路由：运行中' : '跨屏路由：已暂停锁定'}
-            </button>
-            <button
-              type="button"
-              onClick={onEmergencyReturnPrimary}
-              className="px-3 py-1.5 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 whitespace-nowrap shrink-0"
-            >
-              紧急回收回主屏 (Ctrl+Alt+Shift+Esc)
-            </button>
-            <button
-              type="button"
-              disabled={!daemonActive}
-              onClick={() => onStepCursor(-0.45, 0)}
-              className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 text-slate-700 dark:text-slate-200 whitespace-nowrap shrink-0"
-            >
-              <ArrowLeft className="w-3.5 h-3.5" />
-              鼠标左移跨屏
-            </button>
-            <button
-              type="button"
-              disabled={!daemonActive}
-              onClick={() => onStepCursor(0, -0.45)}
-              className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 text-slate-700 dark:text-slate-200 whitespace-nowrap shrink-0"
-            >
-              <ArrowUp className="w-3.5 h-3.5" />
-              鼠标上移跨屏
-            </button>
-            <button
-              type="button"
-              disabled={!daemonActive}
-              onClick={() => onStepCursor(0, 0.45)}
-              className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 text-slate-700 dark:text-slate-200 whitespace-nowrap shrink-0"
-            >
-              <ArrowDown className="w-3.5 h-3.5" />
-              鼠标下移跨屏
-            </button>
-            <button
-              type="button"
-              disabled={!daemonActive}
-              onClick={() => onStepCursor(0.45, 0)}
-              className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 text-slate-700 dark:text-slate-200 whitespace-nowrap shrink-0"
-            >
-              鼠标右移跨屏
-              <ArrowRight className="w-3.5 h-3.5" />
-            </button>
-          </div>
-        </div>
-
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 pt-4 items-center">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 items-center">
           <div className="space-y-1">
             <div className="text-xs text-slate-500 dark:text-slate-400">当前鼠标所在屏幕</div>
-            <div className="text-base font-semibold text-slate-900 dark:text-slate-100 flex items-center gap-2">
+            <div className="text-sm font-semibold text-slate-900 dark:text-slate-100 flex items-center gap-2">
               <MousePointer className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" />
-              <span>{activeFocusNode?.name}</span>
+              <span>{activeFocusNode?.name ?? '本机主屏幕'}</span>
             </div>
             <div className="text-xs font-mono text-slate-500 dark:text-slate-400 tabular-nums">
-              归一化光标坐标: ({Math.round(cursor.x * 100)}%, {Math.round(cursor.y * 100)}%) · 累计跨屏切换: {cursor.transitionCount} 次
+              光标相对位置 ({Math.round(cursor.x * 100)}%, {Math.round(cursor.y * 100)}%) · 累计跨屏切换 {cursor.transitionCount} 次
             </div>
           </div>
 
           <div className="space-y-1">
-            <div className="text-xs text-slate-500 dark:text-slate-400">键盘控制自动跟随目标</div>
-            <div className="text-base font-semibold text-slate-900 dark:text-slate-100 flex items-center gap-2">
+            <div className="text-xs text-slate-500 dark:text-slate-400">键盘输入实时跟随目标</div>
+            <div className="text-sm font-semibold text-slate-900 dark:text-slate-100 flex items-center gap-2">
               <Keyboard className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" />
-              <span>{activeFocusNode?.name} ({activeFocusNode ? getOsLabel(activeFocusNode.os) : ''})</span>
+              <span>
+                {activeFocusNode?.name} ({activeFocusNode ? getOsLabel(activeFocusNode.os) : ''})
+              </span>
             </div>
             <div className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
-              QUIC 加密数据报传输 · 采样率 {hidPollingHz}Hz · 屏幕同步 {activeFocusNode?.refreshRateHz}Hz
+              QUIC TLS 1.3 加密传输 · 监听 UDP {systemStatus.quicPort} · 在线互联 {systemStatus.connectedPeerCount} 台
             </div>
           </div>
 
-          <div className="space-y-2">
-            <div className="flex items-center justify-between text-xs">
-              <span className="text-slate-500 dark:text-slate-400">测试物理按键在当前焦点屏幕的映射输出：</span>
+          <div className="space-y-1 md:text-right">
+            <div className="text-xs text-slate-500 dark:text-slate-400">全局紧急收回键鼠热键</div>
+            <div className="text-sm font-mono font-semibold text-blue-700 dark:text-blue-400">
+              {releaseHotkey}
             </div>
-            <div className="flex flex-wrap gap-1.5">
-              {['Command (⌘)', 'Option (⌥)', 'CapsLock', 'F13'].map((k) => (
-                <button
-                  key={k}
-                  type="button"
-                  onClick={() => setLastSimKey(k)}
-                  className={`px-2.5 py-1 text-xs font-mono rounded border transition-colors whitespace-nowrap shrink-0 ${
-                    lastSimKey === k
-                      ? 'border-blue-600 bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300 font-medium'
-                      : 'border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800'
-                  }`}
-                >
-                  {k}
-                </button>
-              ))}
-            </div>
-            <div className="text-xs font-mono text-slate-700 dark:text-slate-300 tabular-nums">
-              主屏按下 {lastSimKey} → 注入当前屏幕：{mappedPreview.outputKey}
+            <div className="text-xs text-slate-500 dark:text-slate-400">
+              任何时候按下该组合键立即解除远端接管并回到本机屏幕
             </div>
           </div>
         </div>

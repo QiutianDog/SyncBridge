@@ -4,8 +4,13 @@ import type {
   DiscoveredPeer,
   EngineTuning,
   KeyMappingRule,
+  LocalSystemStatus,
   TransferRecord,
   VirtualCursorState,
+} from '../utils/kvmEngine';
+import {
+  DEFAULT_QUIC_PORT,
+  DISCOVERY_UDP_PORT,
 } from '../utils/kvmEngine';
 import {
   INITIAL_DISCOVERED_PEERS,
@@ -24,14 +29,7 @@ export interface DaemonSnapshot {
   transfers: TransferRecord[];
   localEphemeralPin: string;
   activeDriverName: string;
-}
-
-export interface WorkspaceFileEntry {
-  path: string;
-  category: string;
-  summary: string;
-  lineCount: number;
-  byteSize: number;
+  systemStatus: LocalSystemStatus;
 }
 
 declare global {
@@ -46,15 +44,17 @@ export function isTauriNativeRuntime(): boolean {
   return typeof window !== 'undefined' && Boolean(window.__TAURI_INTERNALS__?.invoke);
 }
 
-const DEFAULT_TUNING: EngineTuning = {
+export const DEFAULT_TUNING: EngineTuning = {
   daemonActive: true,
   hidPollingHz: 1000,
   edgeDelayMs: 0,
   releaseHotkey: 'Ctrl + Alt + Shift + Esc',
   linuxWaylandStrategy: 'portal-and-uinput-fallback',
+  hideDockIcon: false,
+  localDeviceName: 'MacBook-Pro',
 };
 
-const DEFAULT_CLIPBOARD_POLICY: ClipboardPolicy = {
+export const DEFAULT_CLIPBOARD_POLICY: ClipboardPolicy = {
   syncPlainText: true,
   syncImages: true,
   enableDragDropFile: true,
@@ -77,7 +77,8 @@ export function normalizeDaemonSnapshot(
       ? (src.nodes as DeviceNode[])
       : (fallback?.nodes ?? INITIAL_NODES);
 
-  const primaryId = nodes.find((n) => n.isPrimary)?.id ?? nodes[0]?.id ?? 'node-mac-studio';
+  const primaryNode = nodes.find((n) => n.isPrimary) ?? nodes[0];
+  const primaryId = primaryNode?.id ?? 'node-local-host';
 
   const rawCursor =
     src.cursor && typeof src.cursor === 'object'
@@ -135,9 +136,18 @@ export function normalizeDaemonSnapshot(
     src.tuning && typeof src.tuning === 'object'
       ? (src.tuning as Partial<EngineTuning>)
       : {};
+  const baseTuning = fallback?.tuning ?? DEFAULT_TUNING;
   const tuning: EngineTuning = {
-    ...(fallback?.tuning ?? DEFAULT_TUNING),
+    ...baseTuning,
     ...rawTuning,
+    hideDockIcon:
+      typeof rawTuning.hideDockIcon === 'boolean'
+        ? rawTuning.hideDockIcon
+        : (baseTuning.hideDockIcon ?? false),
+    localDeviceName:
+      typeof rawTuning.localDeviceName === 'string' && rawTuning.localDeviceName.trim()
+        ? rawTuning.localDeviceName
+        : (primaryNode?.name ?? baseTuning.localDeviceName),
   };
 
   const rawPolicy =
@@ -157,7 +167,42 @@ export function normalizeDaemonSnapshot(
   const activeDriverName =
     typeof src.activeDriverName === 'string' && src.activeDriverName.trim()
       ? src.activeDriverName
-      : (fallback?.activeDriverName ?? 'Tauri v2 原生跨平台驱动就绪');
+      : (fallback?.activeDriverName ?? 'macOS CoreGraphics CGEventTap + CGEventPost');
+
+  const rawSys =
+    src.systemStatus && typeof src.systemStatus === 'object'
+      ? (src.systemStatus as Partial<LocalSystemStatus>)
+      : {};
+
+  const systemStatus: LocalSystemStatus = {
+    localNodeId:
+      typeof rawSys.localNodeId === 'string' && rawSys.localNodeId
+        ? rawSys.localNodeId
+        : primaryId,
+    localOs: rawSys.localOs ?? primaryNode?.os ?? 'macos',
+    localIp:
+      typeof rawSys.localIp === 'string' && rawSys.localIp
+        ? rawSys.localIp
+        : (primaryNode?.ip ?? '192.168.50.10'),
+    quicPort:
+      typeof rawSys.quicPort === 'number' ? rawSys.quicPort : DEFAULT_QUIC_PORT,
+    discoveryPort:
+      typeof rawSys.discoveryPort === 'number'
+        ? rawSys.discoveryPort
+        : DISCOVERY_UDP_PORT,
+    fingerprint:
+      typeof rawSys.fingerprint === 'string' && rawSys.fingerprint
+        ? rawSys.fingerprint
+        : (primaryNode?.fingerprint ?? 'ED25519:9A:4C:E2:11'),
+    inputPermissionGranted:
+      typeof rawSys.inputPermissionGranted === 'boolean'
+        ? rawSys.inputPermissionGranted
+        : true,
+    connectedPeerCount:
+      typeof rawSys.connectedPeerCount === 'number'
+        ? rawSys.connectedPeerCount
+        : Math.max(0, nodes.filter((n) => !n.isPrimary && n.online).length),
+  };
 
   return {
     nodes,
@@ -169,6 +214,7 @@ export function normalizeDaemonSnapshot(
     transfers,
     localEphemeralPin,
     activeDriverName,
+    systemStatus,
   };
 }
 
@@ -220,58 +266,5 @@ export async function invokeDaemonCommand<
     return data;
   } catch (err) {
     return { ok: false, error: String(err) } as T;
-  }
-}
-
-export async function fetchWorkspaceManifest(): Promise<WorkspaceFileEntry[]> {
-  if (isTauriNativeRuntime() && window.__TAURI_INTERNALS__) {
-    try {
-      const files = await window.__TAURI_INTERNALS__.invoke<WorkspaceFileEntry[]>(
-        'get_workspace_files'
-      );
-      return Array.isArray(files) ? files : [];
-    } catch {
-      return [];
-    }
-  }
-
-  try {
-    const res = await fetch('/api/workspace/files');
-    if (!res.ok) return [];
-    const data = (await res.json()) as { files: WorkspaceFileEntry[] };
-    return Array.isArray(data.files) ? data.files : [];
-  } catch {
-    return [];
-  }
-}
-
-export async function fetchWorkspaceFileContent(
-  filePath: string
-): Promise<{ path: string; category: string; summary: string; content: string } | null> {
-  if (isTauriNativeRuntime() && window.__TAURI_INTERNALS__) {
-    try {
-      const detail = await window.__TAURI_INTERNALS__.invoke<{
-        path: string;
-        category: string;
-        summary: string;
-        content: string;
-      } | null>('get_workspace_file', { filePath });
-      return detail ?? null;
-    } catch {
-      return null;
-    }
-  }
-
-  try {
-    const res = await fetch(`/api/workspace/file?path=${encodeURIComponent(filePath)}`);
-    if (!res.ok) return null;
-    return (await res.json()) as {
-      path: string;
-      category: string;
-      summary: string;
-      content: string;
-    };
-  } catch {
-    return null;
   }
 }

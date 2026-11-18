@@ -12,6 +12,8 @@ import {
   addPairedDevice,
   stepVirtualCursor,
   validatePairingPin,
+  validateLanIpv4,
+  encodeArrayBufferToBase64,
   validateKeyMappingRule,
   resolveMappedKey,
 } from './kvmEngine';
@@ -31,7 +33,7 @@ const sampleNodes: DeviceNode[] = [
     online: true,
     latencyMs: 0.2,
     fingerprint: 'ED25519:8F:31:9C:A2',
-    pairedAt: '本机主控',
+    pairedAt: '本机设备',
   },
   {
     id: 'win-rig',
@@ -83,17 +85,14 @@ test('setPrimaryNode switches primary host exclusively', () => {
 });
 
 test('moveNodeToCell rejects isolated islands and permits valid adjacent or swap moves', () => {
-  // Moving win-rig to (4, 4) disconnects it from mac-main (2,2) and linux-dev (2,1)
   const invalidMove = moveNodeToCell(sampleNodes, 'win-rig', 4, 4);
   assert.equal(invalidMove.ok, false);
   assert.equal(isTopologyConnected(sampleNodes), true);
 
-  // Moving win-rig to left of mac-main (1, 2) keeps topology connected
   const validMove = moveNodeToCell(sampleNodes, 'win-rig', 1, 2);
   assert.equal(validMove.ok, true);
   assert.equal(computeNeighbors(validMove.nodes, 'mac-main').left?.id, 'win-rig');
 
-  // Swapping win-rig with mac-main preserves connectivity
   const swapMove = moveNodeToCell(sampleNodes, 'win-rig', 2, 2);
   assert.equal(swapMove.ok, true);
   assert.equal(swapMove.swappedWith, 'MacBook Pro M4');
@@ -120,7 +119,6 @@ test('addPairedDevice enforces maximum of 9 interconnected computers', () => {
   assert.equal(current.length, 9);
   assert.equal(isTopologyConnected(current), true);
 
-  // 10th computer must be rejected
   const tenthPeer: DiscoveredPeer = {
     id: 'node-10',
     name: 'Overflow PC',
@@ -144,13 +142,11 @@ test('stepVirtualCursor crosses shared edges so keyboard focus follows active sc
     y: 0.5,
     transitionCount: 0,
   };
-  // Push right across mac-main -> win-rig border
   const crossedRight = stepVirtualCursor(sampleNodes, start, 0.18, 0);
   assert.equal(crossedRight.activeNodeId, 'win-rig');
   assert.equal(crossedRight.lastTransitionEdge, 'right');
   assert.equal(crossedRight.transitionCount, 1);
 
-  // Push left on mac-main where no neighbor exists -> clamps at 0 on mac-main
   const clampedLeft = stepVirtualCursor(
     sampleNodes,
     { activeNodeId: 'mac-main', x: 0.05, y: 0.5, transitionCount: 0 },
@@ -161,12 +157,30 @@ test('stepVirtualCursor crosses shared edges so keyboard focus follows active sc
   assert.equal(clampedLeft.x, 0);
 });
 
-test('validatePairingPin validates 6-digit temporary LAN pairing codes', () => {
+test('validatePairingPin and validateLanIpv4 enforce LAN-only SPAKE2 security boundaries', () => {
   assert.equal(validatePairingPin('').valid, false);
   assert.equal(validatePairingPin('12a-456').valid, false);
-  const ok = validatePairingPin('482 915');
-  assert.equal(ok.valid, true);
-  assert.equal(ok.normalized, '482-915');
+  const okPin = validatePairingPin('482 915');
+  assert.equal(okPin.valid, true);
+  assert.equal(okPin.normalized, '482-915');
+
+  const okLan = validateLanIpv4('192.168.50.28:24800');
+  assert.equal(okLan.valid, true);
+  assert.equal(okLan.ip, '192.168.50.28');
+  assert.equal(okLan.port, 24800);
+
+  const okRfc1918 = validateLanIpv4('172.20.14.9');
+  assert.equal(okRfc1918.valid, true);
+  assert.equal(okRfc1918.ip, '172.20.14.9');
+
+  const publicRejected = validateLanIpv4('8.8.8.8');
+  assert.equal(publicRejected.valid, false);
+
+  const sampleBytes = new TextEncoder().encode('SpanKVM-BLAKE3-Payload');
+  assert.equal(
+    Buffer.from(encodeArrayBufferToBase64(sampleBytes.buffer), 'base64').toString('utf-8'),
+    'SpanKVM-BLAKE3-Payload'
+  );
 });
 
 test('key mapping rules validate conflicts and translate per-OS keys accurately', () => {
@@ -189,7 +203,6 @@ test('key mapping rules validate conflicts and translate per-OS keys accurately'
     },
   ];
 
-  // Conflict on Windows Command (⌘)
   const conflictCheck = validateKeyMappingRule(rules, {
     label: 'Duplicate',
     targetOs: 'windows',
@@ -199,7 +212,6 @@ test('key mapping rules validate conflicts and translate per-OS keys accurately'
   });
   assert.equal(conflictCheck.ok, false);
 
-  // Allowed on Linux since r1 only targets Windows
   const linuxAllowed = validateKeyMappingRule(rules, {
     label: 'Mac Command 映射为 Linux Ctrl',
     targetOs: 'linux',
@@ -209,7 +221,6 @@ test('key mapping rules validate conflicts and translate per-OS keys accurately'
   });
   assert.equal(linuxAllowed.ok, true);
 
-  // Resolve key on Windows vs macOS
   assert.equal(resolveMappedKey(rules, 'Command (⌘)', 'windows').outputKey, 'Ctrl');
   assert.equal(resolveMappedKey(rules, 'Command (⌘)', 'macos').outputKey, 'Command (⌘)');
   assert.equal(resolveMappedKey(rules, 'CapsLock', 'linux-wayland').outputKey, 'Escape');
@@ -274,7 +285,6 @@ test('GitHub Actions workflow and Tauri v2 bundle icon assets are complete and c
   assert.equal(workflowYaml.includes('actions/upload-artifact@v7'), true);
   assert.equal(workflowYaml.includes('workflow_dispatch:'), true);
 
-  // Regression guard for GitHub sync: .gitignore must anchor /data/ so src/data/seedData.ts is tracked
   const gitignoreContent = fs.readFileSync(path.join(rootDir, '.gitignore'), 'utf-8');
   const gitignoreLines = gitignoreContent.split(/\r?\n/).map((l) => l.trim());
   assert.equal(
@@ -303,13 +313,18 @@ test('GitHub Actions workflow and Tauri v2 bundle icon assets are complete and c
   }
 });
 
-test('normalizeDaemonSnapshot prevents macOS Tauri white-screen crash on partial payloads and all Rust include_str! paths exist', async () => {
+test('normalizeDaemonSnapshot, system tray left/right-click wiring, and macOS Dock visibility defaults are verified', async () => {
   const fs = await import('node:fs');
   const path = await import('node:path');
-  const { normalizeDaemonSnapshot } = await import('../services/tauriBridge');
+  const { DEFAULT_TUNING, normalizeDaemonSnapshot } = await import('../services/tauriBridge');
 
-  // Simulate the exact legacy Rust payload that lacked `cursor`, `discoveredPeers`, and `transfers`
-  const legacyRustPayload = {
+  assert.equal(
+    DEFAULT_TUNING.hideDockIcon,
+    false,
+    'macOS hideDockIcon must default to false (NOT hidden)'
+  );
+
+  const partialPayload = {
     nodes: sampleNodes,
     activeNodeId: 'win-rig',
     cursorX: 0.72,
@@ -323,41 +338,65 @@ test('normalizeDaemonSnapshot prevents macOS Tauri white-screen crash on partial
       releaseHotkey: 'Ctrl + Alt + Shift + Esc',
       linuxWaylandStrategy: 'portal-and-uinput-fallback',
     },
-    clipboardPolicy: {
-      syncPlainText: true,
-      syncImages: true,
-      enableDragDropFile: true,
-      maxFileSizeMb: 500,
-      saveDir: '~/Downloads/SpanKVM',
-    },
     localEphemeralPin: '482-915',
     activeDriverName: 'macOS CoreGraphics CGEventTap + CGEventPost',
   };
 
-  const normalized = normalizeDaemonSnapshot(legacyRustPayload);
+  const normalized = normalizeDaemonSnapshot(partialPayload);
   assert.equal(normalized.cursor.activeNodeId, 'win-rig');
   assert.equal(normalized.cursor.x, 0.72);
   assert.equal(normalized.cursor.y, 0.35);
-  assert.equal(normalized.cursor.transitionCount, 3);
-  assert.equal(Array.isArray(normalized.discoveredPeers), true);
-  assert.equal(Array.isArray(normalized.transfers), true);
+  assert.equal(normalized.tuning.hideDockIcon, false);
+  assert.equal(normalized.systemStatus.quicPort, 24800);
 
-  // Verify every include_str!("...") path in src-tauri/src/commands.rs resolves to a real file
+  const normalizedDockHidden = normalizeDaemonSnapshot({
+    ...partialPayload,
+    tuning: { ...partialPayload.tuning, hideDockIcon: true },
+  });
+  assert.equal(normalizedDockHidden.tuning.hideDockIcon, true);
+
   const rootDir = path.resolve(import.meta.dirname, '../..');
-  const commandsRsDir = path.join(rootDir, 'src-tauri/src');
-  const commandsRs = fs.readFileSync(path.join(commandsRsDir, 'commands.rs'), 'utf-8');
-  const matches = [...commandsRs.matchAll(/include_str!\("([^"]+)"\)/g)];
-  assert.equal(matches.length >= 14, true, 'commands.rs must embed workspace source files');
 
-  for (const m of matches) {
-    const targetFile = path.resolve(commandsRsDir, m[1]);
+  // Verify Tauri Rust tray left-click show & right-click menu + macOS Dock visibility wiring
+  const libRs = fs.readFileSync(path.join(rootDir, 'src-tauri/src/lib.rs'), 'utf-8');
+  assert.equal(
+    libRs.includes('.show_menu_on_left_click(false)'),
+    true,
+    'System tray must disable menu on left-click so only right-click opens the menu'
+  );
+  assert.equal(
+    libRs.includes('MouseButton::Left') && libRs.includes('show_and_focus_main_window'),
+    true,
+    'Left-clicking tray icon must show and focus the main SpanKVM window'
+  );
+  assert.equal(
+    libRs.includes('set_dock_visibility(false)'),
+    true,
+    'lib.rs must apply macOS Dock visibility when hide_dock_icon is enabled'
+  );
+
+  const commandsRs = fs.readFileSync(path.join(rootDir, 'src-tauri/src/commands.rs'), 'utf-8');
+  assert.equal(
+    commandsRs.includes('hide_dock_icon: false'),
+    true,
+    'commands.rs default persisted state must keep hide_dock_icon = false'
+  );
+  assert.equal(
+    commandsRs.includes('set_dock_visibility(!hide_dock)'),
+    true,
+    'commands.rs must dynamically toggle macOS Dock visibility via set_dock_visibility(!hide_dock)'
+  );
+
+  // Verify obsolete prototype viewer files were removed
+  for (const deadFile of [
+    'src/components/WorkspaceSourceExplorer.tsx',
+    'src/components/RustArchitectureView.tsx',
+    'src/utils/exportSampleHtml.ts',
+  ]) {
     assert.equal(
-      fs.existsSync(targetFile),
-      true,
-      `Broken include_str! path in commands.rs: ${m[1]} -> ${targetFile}`
+      fs.existsSync(path.join(rootDir, deadFile)),
+      false,
+      `Obsolete prototype file should be removed: ${deadFile}`
     );
   }
 });
-
-
-

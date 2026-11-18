@@ -28,8 +28,9 @@
    - `SpanKVM-macOS-Intel-x64`：Intel 芯片 Mac `.dmg` 与 `.app.zip`
    - `SpanKVM-Linux-Wayland-X11-x64`：含 `.deb`、`.AppImage`、`.rpm`、独立二进制及 `setup-linux-uinput.sh`
 3. **首次本地实机运行提示**：
+   - **系统托盘与程序坞驻留**：**左键点击系统托盘图标**直接展示并聚焦 SpanKVM 主窗口；**右键点击系统托盘图标**才弹出快捷菜单（暂停共享 / 强制切回本机焦点 / 退出）。macOS 版可在「系统与托盘设置」中开启「隐藏程序坞 (Dock) 图标」（**默认不隐藏**）。
    - **macOS（未配置 Apple 付费开发者证书签名时）**：拖入 `/Applications` 后在终端执行一次 `sudo xattr -rd com.apple.quarantine /Applications/SpanKVM.app`，并在「系统设置 -> 隐私与安全性 -> 辅助功能」勾选 `SpanKVM`。
-   - **Windows 10/11**：若出现 SmartScreen 提示，点击「更多信息 -> 仍要运行」，并在防火墙弹窗勾选允许「专用局域网」通信（UDP `24800` / `5353`）。
+   - **Windows 10/11**：若出现 SmartScreen 提示，点击「更多信息 -> 仍要运行」，并在防火墙弹窗勾选允许「专用局域网」通信（QUIC `UDP 24800` / 局域网广播发现 `UDP 24801`）。
    - **Linux Wayland / X11**：GNOME 46+ / KDE Plasma 6 / Hyprland 首次启动会弹出 InputCapture Portal 授权；若合成器不支持 Portal，执行随包附带的 `bash setup-linux-uinput.sh` 即可开启免 root `uinput` 驱动。
 
 ## 本地桌面构建指南

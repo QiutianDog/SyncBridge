@@ -1,17 +1,31 @@
+use std::collections::HashMap;
 use std::fs;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use quinn::Endpoint;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use spankvm_core::{compute_neighbors, move_node_to_cell, set_primary_node};
-use spankvm_pal::detect_active_driver_stack;
-use spankvm_proto::{
-    ClipboardPolicy, DeviceNode, EngineTuning, GridPos, KeyMappingRule, LinuxWaylandStrategy,
-    OsKind, Resolution, GRID_COLS, GRID_ROWS, MAX_DEVICES,
+use spankvm_core::{
+    compute_neighbors, find_next_adjacent_slot, move_node_to_cell, set_primary_node, FocusRouter,
 };
-use tauri::State;
+use spankvm_net::{
+    broadcast_lan_beacon, client_pair_spake2_over_quic, compute_chunk_blake3_hex,
+    detect_local_hostname, detect_local_lan_ipv4, LocalEd25519Identity, QuicPeerSession,
+};
+use spankvm_pal::{
+    clipboard::write_os_clipboard_text, detect_active_driver_stack, detect_local_os_kind,
+    probe_local_display, prompt_input_permission, CaptureControlState, CrossPlatformInjector,
+};
+use spankvm_proto::{
+    decode_base64, encode_base64, ClipboardPolicy, DeviceNode, EngineTuning, GridPos,
+    KeyMappingRule, LanDiscoveryBeacon, LinuxWaylandStrategy, OsKind, ReliableControlFrame,
+    Resolution, DEFAULT_QUIC_PORT, DISCOVERY_UDP_PORT, FILE_CHUNK_SIZE, MAX_DEVICES,
+};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -21,10 +35,13 @@ pub struct DiscoveredPeerDto {
     pub hostname: String,
     pub os: OsKind,
     pub ip: String,
+    pub quic_port: u16,
     pub resolution: Resolution,
     pub refresh_rate_hz: u16,
     pub latency_ms: f32,
     pub fingerprint: String,
+    #[serde(default)]
+    pub last_seen_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +74,19 @@ pub struct TransferRecordDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct LocalSystemStatusDto {
+    pub local_node_id: String,
+    pub local_os: OsKind,
+    pub local_ip: String,
+    pub quic_port: u16,
+    pub discovery_port: u16,
+    pub fingerprint: String,
+    pub input_permission_granted: bool,
+    pub connected_peer_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DaemonSnapshotDto {
     pub nodes: Vec<DeviceNode>,
     pub discovered_peers: Vec<DiscoveredPeerDto>,
@@ -67,6 +97,7 @@ pub struct DaemonSnapshotDto {
     pub transfers: Vec<TransferRecordDto>,
     pub local_ephemeral_pin: String,
     pub active_driver_name: String,
+    pub system_status: LocalSystemStatusDto,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -86,9 +117,9 @@ pub struct IpcEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedDaemonData {
+    pub local_node_id: String,
+    pub identity_secret_hex: String,
     pub nodes: Vec<DeviceNode>,
-    pub discovered_peers: Vec<DiscoveredPeerDto>,
-    pub cursor: VirtualCursorDto,
     pub tuning: EngineTuning,
     pub clipboard_policy: ClipboardPolicy,
     pub key_rules: Vec<KeyMappingRule>,
@@ -98,34 +129,173 @@ pub struct PersistedDaemonData {
 
 pub struct SharedDaemonState {
     pub data: PersistedDaemonData,
+    pub discovered_peers: Vec<DiscoveredPeerDto>,
+    pub cursor: VirtualCursorDto,
+    pub router: FocusRouter,
     pub state_file_path: Option<PathBuf>,
+    pub last_synced_clipboard_hash: String,
 }
 
-impl SharedDaemonState {
+pub struct DaemonHub {
+    pub state: RwLock<SharedDaemonState>,
+    pub sessions: RwLock<HashMap<String, QuicPeerSession>>,
+    pub identity: LocalEd25519Identity,
+    pub capture_ctrl: Arc<CaptureControlState>,
+    pub injector: Mutex<Option<CrossPlatformInjector>>,
+    pub quic_endpoint: RwLock<Option<Endpoint>>,
+    pub quic_port: AtomicU32,
+    pub datagram_seq: AtomicU32,
+}
+
+impl DaemonHub {
+    pub fn build_snapshot(&self) -> DaemonSnapshotDto {
+        let guard = self.state.read().expect("state read lock");
+        let sessions = self.sessions.read().expect("sessions read lock");
+        let driver = detect_active_driver_stack(guard.data.tuning.linux_wayland_strategy);
+        let local_ip = detect_local_lan_ipv4().to_string();
+        let qport = self.quic_port.load(Ordering::Relaxed) as u16;
+
+        let mut nodes = guard.data.nodes.clone();
+        for n in &mut nodes {
+            if n.id == guard.data.local_node_id {
+                n.online = true;
+                n.ip = local_ip.clone();
+                n.latency_ms = 0.1;
+                if !guard.data.tuning.local_device_name.trim().is_empty() {
+                    n.name = guard.data.tuning.local_device_name.trim().to_string();
+                }
+            } else if let Some(sess) = sessions.get(&n.id) {
+                n.online = true;
+                n.latency_ms = sess.rtt_ms();
+                n.ip = sess.peer_ip.to_string();
+            } else {
+                n.online = false;
+            }
+        }
+
+        let visible_peers: Vec<DiscoveredPeerDto> = guard
+            .discovered_peers
+            .iter()
+            .filter(|p| p.id != guard.data.local_node_id && !nodes.iter().any(|n| n.id == p.id))
+            .cloned()
+            .collect();
+
+        DaemonSnapshotDto {
+            nodes,
+            discovered_peers: visible_peers,
+            cursor: guard.cursor.clone(),
+            tuning: guard.data.tuning.clone(),
+            clipboard_policy: guard.data.clipboard_policy.clone(),
+            key_rules: guard.data.key_rules.clone(),
+            transfers: guard.data.transfers.clone(),
+            local_ephemeral_pin: format_pin_from_seed(guard.data.pin_seed),
+            active_driver_name: driver.os_backend_name.to_string(),
+            system_status: LocalSystemStatusDto {
+                local_node_id: guard.data.local_node_id.clone(),
+                local_os: detect_local_os_kind(),
+                local_ip,
+                quic_port: qport,
+                discovery_port: DISCOVERY_UDP_PORT,
+                fingerprint: self.identity.fingerprint.clone(),
+                input_permission_granted: driver.permission_granted,
+                connected_peer_count: sessions.len(),
+            },
+        }
+    }
+
     pub fn persist(&self) {
-        if let Some(ref path) = self.state_file_path {
+        let guard = self.state.read().expect("state read lock");
+        if let Some(ref path) = guard.state_file_path {
             if let Some(parent) = path.parent() {
                 let _ = fs::create_dir_all(parent);
             }
-            if let Ok(serialized) = serde_json::to_string_pretty(&self.data) {
+            if let Ok(serialized) = serde_json::to_string_pretty(&guard.data) {
                 let _ = fs::write(path, serialized);
             }
         }
     }
 
-    pub fn build_snapshot(&self) -> DaemonSnapshotDto {
-        let driver = detect_active_driver_stack(self.data.tuning.linux_wayland_strategy);
-        DaemonSnapshotDto {
-            nodes: self.data.nodes.clone(),
-            discovered_peers: self.data.discovered_peers.clone(),
-            cursor: self.data.cursor.clone(),
-            tuning: self.data.tuning.clone(),
-            clipboard_policy: self.data.clipboard_policy.clone(),
-            key_rules: self.data.key_rules.clone(),
-            transfers: self.data.transfers.clone(),
-            local_ephemeral_pin: format_pin_from_seed(self.data.pin_seed),
-            active_driver_name: driver.os_backend_name.to_string(),
+    pub fn sync_capture_edges(&self) {
+        let guard = self.state.read().expect("state read lock");
+        let sessions = self.sessions.read().expect("sessions read lock");
+        self.capture_ctrl
+            .set_daemon_enabled(guard.data.tuning.daemon_active);
+
+        let local_id = &guard.data.local_node_id;
+        let neighbors = compute_neighbors(&guard.data.nodes, local_id);
+        let is_online_peer = |opt: Option<&DeviceNode>| -> bool {
+            opt.map(|n| n.id == *local_id || sessions.contains_key(&n.id))
+                .unwrap_or(false)
+        };
+        let armed = [
+            is_online_peer(neighbors.up),
+            is_online_peer(neighbors.down),
+            is_online_peer(neighbors.left),
+            is_online_peer(neighbors.right),
+        ];
+        self.capture_ctrl.set_armed_edges(armed);
+    }
+
+    pub fn local_node_descriptor(&self) -> DeviceNode {
+        let guard = self.state.read().expect("state read lock");
+        let local_ip = detect_local_lan_ipv4().to_string();
+        if let Some(existing) = guard
+            .data
+            .nodes
+            .iter()
+            .find(|n| n.id == guard.data.local_node_id)
+        {
+            let mut copy = existing.clone();
+            copy.ip = local_ip;
+            copy.online = true;
+            if !guard.data.tuning.local_device_name.trim().is_empty() {
+                copy.name = guard.data.tuning.local_device_name.trim().to_string();
+            }
+            return copy;
         }
+        let (resolution, refresh_rate_hz) = probe_local_display();
+        let hostname = detect_local_hostname();
+        DeviceNode {
+            id: guard.data.local_node_id.clone(),
+            name: hostname.clone(),
+            hostname,
+            os: detect_local_os_kind(),
+            ip: local_ip,
+            resolution,
+            refresh_rate_hz,
+            is_primary: true,
+            grid_pos: GridPos { col: 2, row: 2 },
+            auto_pair: true,
+            online: true,
+            latency_ms: 0.1,
+            fingerprint: self.identity.fingerprint.clone(),
+            paired_at: "本机设备".into(),
+        }
+    }
+
+    pub fn emit_beacon_now(&self) {
+        let local_ip = detect_local_lan_ipv4();
+        let node = self.local_node_descriptor();
+        let qport = self.quic_port.load(Ordering::Relaxed) as u16;
+        let beacon = LanDiscoveryBeacon {
+            magic: LanDiscoveryBeacon::MAGIC.to_string(),
+            node_id: node.id,
+            name: node.name,
+            hostname: node.hostname,
+            os: node.os,
+            quic_port: qport,
+            resolution: node.resolution,
+            refresh_rate_hz: node.refresh_rate_hz,
+            fingerprint: self.identity.fingerprint.clone(),
+            sent_epoch_ms: now_epoch_millis() as u64,
+        };
+        broadcast_lan_beacon(&beacon, local_ip);
+    }
+
+    pub fn notify_frontend(&self, app_handle: &AppHandle) {
+        self.sync_capture_edges();
+        let snap = self.build_snapshot();
+        let _ = app_handle.emit("spankvm://snapshot", snap);
     }
 }
 
@@ -134,14 +304,14 @@ pub fn format_pin_from_seed(seed: u64) -> String {
     format!("{:03}-{:03}", n / 1000, n % 1000)
 }
 
-fn now_epoch_millis() -> u128 {
+pub fn now_epoch_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(1_763_400_000_000)
 }
 
-fn now_hms_string() -> String {
+pub fn now_hms_string() -> String {
     let total_secs = (now_epoch_millis() / 1000) % 86_400;
     let hours = (total_secs / 3600) % 24;
     let mins = (total_secs % 3600) / 60;
@@ -149,283 +319,100 @@ fn now_hms_string() -> String {
     format!("{hours:02}:{mins:02}:{secs:02}")
 }
 
-pub fn default_nodes_preset() -> Vec<DeviceNode> {
-    vec![
-        DeviceNode {
-            id: "node-mac-studio".into(),
-            name: "MacBook Pro M4".into(),
-            hostname: "mbp-m4-studio.local".into(),
-            os: OsKind::MacOs,
-            ip: "192.168.50.10".into(),
-            resolution: Resolution { width: 3024, height: 1964 },
-            refresh_rate_hz: 120,
-            is_primary: cfg!(target_os = "macos") || (!cfg!(target_os = "windows") && !cfg!(target_os = "linux")),
-            grid_pos: GridPos { col: 2, row: 2 },
-            auto_pair: true,
-            online: true,
-            latency_ms: if cfg!(target_os = "macos") { 0.1 } else { 0.4 },
-            fingerprint: "ED25519:9A:4C:E2:11".into(),
-            paired_at: if cfg!(target_os = "macos") { "本机宿主".into() } else { "已互信节点".into() },
-        },
-        DeviceNode {
-            id: "node-win-tower".into(),
-            name: "Win11 主力工作站".into(),
-            hostname: "win11-rtx4090.local".into(),
-            os: OsKind::Windows,
-            ip: "192.168.50.18".into(),
-            resolution: Resolution { width: 3840, height: 2160 },
-            refresh_rate_hz: 240,
-            is_primary: cfg!(target_os = "windows"),
-            grid_pos: GridPos { col: 3, row: 2 },
-            auto_pair: true,
-            online: true,
-            latency_ms: if cfg!(target_os = "windows") { 0.1 } else { 0.5 },
-            fingerprint: "ED25519:3D:88:7B:04".into(),
-            paired_at: if cfg!(target_os = "windows") { "本机宿主".into() } else { "已互信节点".into() },
-        },
-        DeviceNode {
-            id: "node-ubuntu-wayland".into(),
-            name: "Ubuntu 编译服务器".into(),
-            hostname: "ubuntu-2404-dev.local".into(),
-            os: OsKind::LinuxWayland,
-            ip: "192.168.50.26".into(),
-            resolution: Resolution { width: 2560, height: 1440 },
-            refresh_rate_hz: 144,
-            is_primary: cfg!(target_os = "linux"),
-            grid_pos: GridPos { col: 2, row: 1 },
-            auto_pair: true,
-            online: true,
-            latency_ms: if cfg!(target_os = "linux") { 0.1 } else { 0.6 },
-            fingerprint: "ED25519:71:F0:2C:69".into(),
-            paired_at: if cfg!(target_os = "linux") { "本机宿主".into() } else { "已互信节点".into() },
-        },
-        DeviceNode {
-            id: "node-arch-x11".into(),
-            name: "Arch Linux 测试机".into(),
-            hostname: "arch-thinkpad.local".into(),
-            os: OsKind::LinuxX11,
-            ip: "192.168.50.31".into(),
-            resolution: Resolution { width: 2560, height: 1600 },
-            refresh_rate_hz: 120,
-            is_primary: false,
-            grid_pos: GridPos { col: 1, row: 2 },
-            auto_pair: true,
-            online: true,
-            latency_ms: 0.7,
-            fingerprint: "ED25519:C5:19:4A:8E".into(),
-            paired_at: "已互信节点".into(),
-        },
-    ]
-}
-
-pub fn nine_grid_preset() -> Vec<DeviceNode> {
-    let mut base = default_nodes_preset();
-    base.extend([
-        DeviceNode {
-            id: "node-mac-mini".into(),
-            name: "Mac mini 构建节点".into(),
-            hostname: "mac-mini-ci.local".into(),
-            os: OsKind::MacOs,
-            ip: "192.168.50.42".into(),
-            resolution: Resolution { width: 2560, height: 1440 },
-            refresh_rate_hz: 120,
-            is_primary: false,
-            grid_pos: GridPos { col: 1, row: 1 },
-            auto_pair: true,
-            online: true,
-            latency_ms: 0.6,
-            fingerprint: "ED25519:44:B2:10:9F".into(),
-            paired_at: "已互信节点".into(),
-        },
-        DeviceNode {
-            id: "node-win-surface".into(),
-            name: "Surface 调试终端".into(),
-            hostname: "win11-surface.local".into(),
-            os: OsKind::Windows,
-            ip: "192.168.50.48".into(),
-            resolution: Resolution { width: 2880, height: 1920 },
-            refresh_rate_hz: 120,
-            is_primary: false,
-            grid_pos: GridPos { col: 3, row: 1 },
-            auto_pair: true,
-            online: true,
-            latency_ms: 0.8,
-            fingerprint: "ED25519:6E:08:FA:23".into(),
-            paired_at: "已互信节点".into(),
-        },
-        DeviceNode {
-            id: "node-fedora-lab".into(),
-            name: "Fedora Wayland 节点".into(),
-            hostname: "fedora-ws.local".into(),
-            os: OsKind::LinuxWayland,
-            ip: "192.168.50.53".into(),
-            resolution: Resolution { width: 2560, height: 1440 },
-            refresh_rate_hz: 144,
-            is_primary: false,
-            grid_pos: GridPos { col: 1, row: 3 },
-            auto_pair: true,
-            online: true,
-            latency_ms: 0.6,
-            fingerprint: "ED25519:92:C1:34:7D".into(),
-            paired_at: "已互信节点".into(),
-        },
-        DeviceNode {
-            id: "node-win-sim".into(),
-            name: "Win11 高刷渲染机".into(),
-            hostname: "win11-oled360.local".into(),
-            os: OsKind::Windows,
-            ip: "192.168.50.61".into(),
-            resolution: Resolution { width: 2560, height: 1440 },
-            refresh_rate_hz: 360,
-            is_primary: false,
-            grid_pos: GridPos { col: 2, row: 3 },
-            auto_pair: true,
-            online: true,
-            latency_ms: 0.4,
-            fingerprint: "ED25519:18:DA:77:B0".into(),
-            paired_at: "已互信节点".into(),
-        },
-        DeviceNode {
-            id: "node-debian-nas".into(),
-            name: "Debian 桌面监控端".into(),
-            hostname: "debian-ops.local".into(),
-            os: OsKind::LinuxX11,
-            ip: "192.168.50.75".into(),
-            resolution: Resolution { width: 1920, height: 1080 },
-            refresh_rate_hz: 60,
-            is_primary: false,
-            grid_pos: GridPos { col: 3, row: 3 },
-            auto_pair: true,
-            online: true,
-            latency_ms: 0.7,
-            fingerprint: "ED25519:53:0E:91:CC".into(),
-            paired_at: "已互信节点".into(),
-        },
-    ]);
-    base
-}
-
-pub fn default_discovered_peers() -> Vec<DiscoveredPeerDto> {
-    vec![
-        DiscoveredPeerDto {
-            id: "node-mac-mini".into(),
-            name: "Mac mini 构建节点".into(),
-            hostname: "mac-mini-ci.local".into(),
-            os: OsKind::MacOs,
-            ip: "192.168.50.42".into(),
-            resolution: Resolution { width: 2560, height: 1440 },
-            refresh_rate_hz: 120,
-            latency_ms: 0.6,
-            fingerprint: "ED25519:44:B2:10:9F".into(),
-        },
-        DiscoveredPeerDto {
-            id: "node-win-sim".into(),
-            name: "Win11 高刷渲染机".into(),
-            hostname: "win11-oled360.local".into(),
-            os: OsKind::Windows,
-            ip: "192.168.50.61".into(),
-            resolution: Resolution { width: 2560, height: 1440 },
-            refresh_rate_hz: 360,
-            latency_ms: 0.4,
-            fingerprint: "ED25519:18:DA:77:B0".into(),
-        },
-        DiscoveredPeerDto {
-            id: "node-fedora-lab".into(),
-            name: "Fedora Wayland 节点".into(),
-            hostname: "fedora-ws.local".into(),
-            os: OsKind::LinuxWayland,
-            ip: "192.168.50.53".into(),
-            resolution: Resolution { width: 2560, height: 1440 },
-            refresh_rate_hz: 144,
-            latency_ms: 0.6,
-            fingerprint: "ED25519:92:C1:34:7D".into(),
-        },
-        DiscoveredPeerDto {
-            id: "node-win-surface".into(),
-            name: "Surface 调试终端".into(),
-            hostname: "win11-surface.local".into(),
-            os: OsKind::Windows,
-            ip: "192.168.50.48".into(),
-            resolution: Resolution { width: 2880, height: 1920 },
-            refresh_rate_hz: 120,
-            latency_ms: 0.8,
-            fingerprint: "ED25519:6E:08:FA:23".into(),
-        },
-        DiscoveredPeerDto {
-            id: "node-debian-nas".into(),
-            name: "Debian 桌面监控端".into(),
-            hostname: "debian-ops.local".into(),
-            os: OsKind::LinuxX11,
-            ip: "192.168.50.75".into(),
-            resolution: Resolution { width: 1920, height: 1080 },
-            refresh_rate_hz: 60,
-            latency_ms: 0.7,
-            fingerprint: "ED25519:53:0E:91:CC".into(),
-        },
-    ]
+pub fn expand_save_dir(raw_dir: &str) -> PathBuf {
+    let trimmed = raw_dir.trim();
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(if trimmed.is_empty() {
+        "SpanKVM-Received"
+    } else {
+        trimmed
+    })
 }
 
 pub fn default_key_rules() -> Vec<KeyMappingRule> {
     vec![
         KeyMappingRule {
-            id: "rule-cmd-win-ctrl".into(),
-            label: "Mac 主控快捷键对齐 Windows Ctrl".into(),
+            id: "rule-mac-cmd-to-win-ctrl".into(),
+            label: "Mac ⌘ Command → Windows Ctrl（复制 / 粘贴 / 全选）".into(),
             target_os: "windows".into(),
             source_key: "Command (⌘)".into(),
             target_key: "Ctrl".into(),
             enabled: true,
         },
         KeyMappingRule {
-            id: "rule-cmd-linux-ctrl".into(),
-            label: "Mac 主控快捷键对齐 Linux Ctrl".into(),
+            id: "rule-mac-cmd-to-linux-ctrl".into(),
+            label: "Mac ⌘ Command → Linux Ctrl（桌面快捷键对齐）".into(),
             target_os: "linux".into(),
             source_key: "Command (⌘)".into(),
             target_key: "Ctrl".into(),
             enabled: true,
         },
         KeyMappingRule {
-            id: "rule-opt-win-alt".into(),
-            label: "Mac Option 映射为 Windows Alt".into(),
+            id: "rule-mac-opt-to-alt".into(),
+            label: "Mac ⌥ Option → Windows Alt".into(),
             target_os: "windows".into(),
             source_key: "Option (⌥)".into(),
             target_key: "Alt".into(),
             enabled: true,
         },
         KeyMappingRule {
-            id: "rule-caps-esc".into(),
-            label: "Vim 效率键：CapsLock 映射为 Escape".into(),
+            id: "rule-caps-to-esc".into(),
+            label: "CapsLock → Escape（全局可选）".into(),
             target_os: "all".into(),
             source_key: "CapsLock".into(),
             target_key: "Escape".into(),
-            enabled: true,
+            enabled: false,
         },
     ]
 }
 
 pub fn create_default_persisted_data() -> PersistedDaemonData {
-    let nodes = default_nodes_preset();
-    let primary_id = nodes
-        .iter()
-        .find(|n| n.is_primary)
-        .map(|n| n.id.clone())
-        .unwrap_or_else(|| "node-mac-studio".into());
+    let identity = LocalEd25519Identity::generate();
+    let hostname = detect_local_hostname();
+    let os = detect_local_os_kind();
+    let (resolution, refresh_rate_hz) = probe_local_display();
+    let ip = detect_local_lan_ipv4().to_string();
+
+    let id_hash = blake3::hash(format!("{}:{}", hostname, identity.pubkey_hex).as_bytes())
+        .to_hex()
+        .to_string();
+    let local_node_id = format!("node-{}", &id_hash[0..10]);
+
+    let local_node = DeviceNode {
+        id: local_node_id.clone(),
+        name: hostname.clone(),
+        hostname: hostname.clone(),
+        os,
+        ip,
+        resolution,
+        refresh_rate_hz,
+        is_primary: true,
+        grid_pos: GridPos { col: 2, row: 2 },
+        auto_pair: true,
+        online: true,
+        latency_ms: 0.1,
+        fingerprint: identity.fingerprint.clone(),
+        paired_at: "本机设备".into(),
+    };
+
+    let seed = (now_epoch_millis() as u64) ^ 0x5A17_C3E9;
 
     PersistedDaemonData {
-        nodes,
-        discovered_peers: default_discovered_peers(),
-        cursor: VirtualCursorDto {
-            active_node_id: primary_id,
-            x: 0.5,
-            y: 0.5,
-            transition_count: 0,
-            last_transition_edge: None,
-        },
+        local_node_id,
+        identity_secret_hex: identity.secret_hex,
+        nodes: vec![local_node],
         tuning: EngineTuning {
             daemon_active: true,
             hid_polling_hz: 1000,
             edge_delay_ms: 0,
             release_hotkey: "Ctrl + Alt + Shift + Esc".into(),
             linux_wayland_strategy: LinuxWaylandStrategy::PortalAndUinputFallback,
+            hide_dock_icon: false,
+            local_device_name: hostname,
         },
         clipboard_policy: ClipboardPolicy {
             sync_plain_text: true,
@@ -435,182 +422,129 @@ pub fn create_default_persisted_data() -> PersistedDaemonData {
             save_dir: "~/Downloads/SpanKVM".into(),
         },
         key_rules: default_key_rules(),
-        transfers: vec![
-            TransferRecordDto {
-                id: "tr-1".into(),
-                record_type: "file-drop".into(),
-                title: "hid_quic_benchmark.csv".into(),
-                size_label: "4.8 MB".into(),
-                from_node_name: "Ubuntu 编译服务器".into(),
-                to_node_name: "MacBook Pro M4".into(),
-                timestamp: "19:02:14".into(),
-                encrypted: true,
-                status: "completed".into(),
-                digest_hex: Some("a94f3c8011b2e74d".into()),
-            },
-            TransferRecordDto {
-                id: "tr-2".into(),
-                record_type: "clipboard-text".into(),
-                title: "SpanKVM QUIC TLS 1.3 会话已就绪".into(),
-                size_label: "42 B".into(),
-                from_node_name: "MacBook Pro M4".into(),
-                to_node_name: "Win11 主力工作站".into(),
-                timestamp: "18:54:09".into(),
-                encrypted: true,
-                status: "completed".into(),
-                digest_hex: Some("7c21e04b938fd110".into()),
-            },
-        ],
-        pin_seed: 482_915,
-    }
-}
-
-fn find_next_adjacent_slot(nodes: &[DeviceNode]) -> Option<GridPos> {
-    let dirs = [(0, -1), (1, 0), (0, 1), (-1, 0)];
-    let mut anchors: Vec<GridPos> = nodes
-        .iter()
-        .filter(|n| n.is_primary)
-        .map(|n| n.grid_pos)
-        .collect();
-    for n in nodes {
-        if !n.is_primary {
-            anchors.push(n.grid_pos);
-        }
-    }
-
-    for anchor in anchors {
-        for (dc, dr) in dirs {
-            let col = anchor.col + dc;
-            let row = anchor.row + dr;
-            if !(0..GRID_COLS).contains(&col) || !(0..GRID_ROWS).contains(&row) {
-                continue;
-            }
-            if !nodes.iter().any(|n| n.grid_pos.col == col && n.grid_pos.row == row) {
-                return Some(GridPos { col, row });
-            }
-        }
-    }
-    None
-}
-
-fn step_cursor_normalized(
-    nodes: &[DeviceNode],
-    cur: &VirtualCursorDto,
-    dx: f32,
-    dy: f32,
-) -> VirtualCursorDto {
-    let mut nx = cur.x + dx;
-    let mut ny = cur.y + dy;
-    let mut target_id = cur.active_node_id.clone();
-    let mut edge: Option<String> = None;
-
-    let neighbors = compute_neighbors(nodes, &target_id);
-    if nx < 0.0 {
-        if let Some(left) = neighbors.left.filter(|n| n.online) {
-            target_id = left.id.clone();
-            nx = (1.0 + nx).clamp(0.04, 0.96);
-            edge = Some("left".into());
-        } else {
-            nx = 0.0;
-        }
-    } else if nx > 1.0 {
-        if let Some(right) = neighbors.right.filter(|n| n.online) {
-            target_id = right.id.clone();
-            nx = (nx - 1.0).clamp(0.04, 0.96);
-            edge = Some("right".into());
-        } else {
-            nx = 1.0;
-        }
-    }
-
-    let v_neighbors = compute_neighbors(nodes, &target_id);
-    if ny < 0.0 {
-        if let Some(up) = v_neighbors.up.filter(|n| n.online) {
-            target_id = up.id.clone();
-            ny = (1.0 + ny).clamp(0.04, 0.96);
-            edge = Some("up".into());
-        } else {
-            ny = 0.0;
-        }
-    } else if ny > 1.0 {
-        if let Some(down) = v_neighbors.down.filter(|n| n.online) {
-            target_id = down.id.clone();
-            ny = (ny - 1.0).clamp(0.04, 0.96);
-            edge = Some("down".into());
-        } else {
-            ny = 1.0;
-        }
-    }
-
-    let crossed = target_id != cur.active_node_id;
-    VirtualCursorDto {
-        active_node_id: target_id,
-        x: nx.clamp(0.0, 1.0),
-        y: ny.clamp(0.0, 1.0),
-        transition_count: if crossed {
-            cur.transition_count + 1
-        } else {
-            cur.transition_count
-        },
-        last_transition_edge: if crossed {
-            edge
-        } else {
-            cur.last_transition_edge.clone()
-        },
+        transfers: Vec::new(),
+        pin_seed: seed,
     }
 }
 
 fn validate_pin(raw: &str) -> Result<String, String> {
-    let digits: String = raw.chars().filter(|c| !c.is_whitespace() && *c != '-').collect();
+    let digits: String = raw
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect();
     if digits.len() != 6 || !digits.chars().all(|c| c.is_ascii_digit()) {
-        return Err("请输入对方屏幕上显示的 6 位数字临时配对码。".into());
+        return Err("请输入对方设备上显示的 6 位数字临时配对码。".into());
     }
     Ok(format!("{}-{}", &digits[0..3], &digits[3..6]))
 }
 
-#[tauri::command]
-pub fn get_daemon_snapshot(
-    state: State<'_, RwLock<SharedDaemonState>>,
-) -> Result<DaemonSnapshotDto, String> {
-    let guard = state.read().map_err(|e| e.to_string())?;
-    Ok(guard.build_snapshot())
+pub fn format_bytes_human(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
 }
 
 #[tauri::command]
-pub fn dispatch_daemon_ipc(
+pub async fn get_daemon_snapshot(
+    hub: State<'_, Arc<DaemonHub>>,
+) -> Result<DaemonSnapshotDto, String> {
+    Ok(hub.build_snapshot())
+}
+
+#[tauri::command]
+pub async fn dispatch_daemon_ipc(
+    app_handle: AppHandle,
+    hub: State<'_, Arc<DaemonHub>>,
     command: String,
-    payload: Value,
-    state: State<'_, RwLock<SharedDaemonState>>,
+    payload: Option<Value>,
 ) -> Result<IpcEnvelope, String> {
-    let mut guard = state.write().map_err(|e| e.to_string())?;
+    let payload = payload.unwrap_or(Value::Object(serde_json::Map::new()));
 
     match command.as_str() {
         "get_daemon_snapshot" => Ok(IpcEnvelope {
             ok: true,
-            snapshot: Some(guard.build_snapshot()),
+            snapshot: Some(hub.build_snapshot()),
             error: None,
             swapped_with: None,
             added_node: None,
         }),
 
+        "scan_lan_peers" => {
+            hub.emit_beacon_now();
+            Ok(IpcEnvelope {
+                ok: true,
+                snapshot: Some(hub.build_snapshot()),
+                error: None,
+                swapped_with: None,
+                added_node: None,
+            })
+        }
+
+        "request_input_permission" => {
+            prompt_input_permission();
+            Ok(IpcEnvelope {
+                ok: true,
+                snapshot: Some(hub.build_snapshot()),
+                error: None,
+                swapped_with: None,
+                added_node: None,
+            })
+        }
+
+        "open_receive_dir" => {
+            let dir = {
+                let guard = hub.state.read().map_err(|e| e.to_string())?;
+                expand_save_dir(&guard.data.clipboard_policy.save_dir)
+            };
+            let _ = fs::create_dir_all(&dir);
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("open").arg(&dir).spawn();
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
+            }
+            Ok(IpcEnvelope {
+                ok: true,
+                snapshot: Some(hub.build_snapshot()),
+                error: None,
+                swapped_with: None,
+                added_node: None,
+            })
+        }
+
         "set_primary_node" => {
             let primary_id = payload
                 .get("primaryId")
                 .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            if let Err(err) = set_primary_node(&mut guard.data.nodes, primary_id) {
-                return Ok(IpcEnvelope {
-                    ok: false,
-                    snapshot: None,
-                    error: Some(err.to_string()),
-                    swapped_with: None,
-                    added_node: None,
-                });
+                .unwrap_or_default()
+                .to_string();
+            {
+                let mut guard = hub.state.write().map_err(|e| e.to_string())?;
+                if let Err(err) = set_primary_node(&mut guard.data.nodes, &primary_id) {
+                    return Ok(IpcEnvelope {
+                        ok: false,
+                        snapshot: None,
+                        error: Some(err.to_string()),
+                        swapped_with: None,
+                        added_node: None,
+                    });
+                }
             }
-            guard.persist();
+            hub.persist();
+            hub.sync_capture_edges();
             Ok(IpcEnvelope {
                 ok: true,
-                snapshot: Some(guard.build_snapshot()),
+                snapshot: Some(hub.build_snapshot()),
                 error: None,
                 swapped_with: None,
                 added_node: None,
@@ -621,37 +555,67 @@ pub fn dispatch_daemon_ipc(
             let node_id = payload
                 .get("nodeId")
                 .and_then(|v| v.as_str())
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .to_string();
             let col = payload.get("col").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
             let row = payload.get("row").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
 
-            let swapped_with = guard
-                .data
-                .nodes
-                .iter()
-                .find(|n| n.id != node_id && n.grid_pos.col == col && n.grid_pos.row == row)
-                .map(|n| n.name.clone());
+            let swapped_with = {
+                let mut guard = hub.state.write().map_err(|e| e.to_string())?;
+                let occupant_name = guard
+                    .data
+                    .nodes
+                    .iter()
+                    .find(|n| n.grid_pos.col == col && n.grid_pos.row == row && n.id != node_id)
+                    .map(|n| n.name.clone());
 
-            match move_node_to_cell(&guard.data.nodes, node_id, col, row) {
-                Ok(updated) => {
-                    guard.data.nodes = updated;
-                    guard.persist();
-                    Ok(IpcEnvelope {
-                        ok: true,
-                        snapshot: Some(guard.build_snapshot()),
-                        error: None,
-                        swapped_with,
-                        added_node: None,
-                    })
+                match move_node_to_cell(&guard.data.nodes, &node_id, col, row) {
+                    Ok(updated) => {
+                        guard.data.nodes = updated;
+                        occupant_name
+                    }
+                    Err(err) => {
+                        return Ok(IpcEnvelope {
+                            ok: false,
+                            snapshot: None,
+                            error: Some(err.to_string()),
+                            swapped_with: None,
+                            added_node: None,
+                        });
+                    }
                 }
-                Err(err) => Ok(IpcEnvelope {
-                    ok: false,
-                    snapshot: None,
-                    error: Some(err.to_string()),
-                    swapped_with: None,
-                    added_node: None,
-                }),
+            };
+
+            hub.persist();
+            hub.sync_capture_edges();
+
+            // Broadcast updated topology layout to connected peers
+            let nodes_copy = hub
+                .state
+                .read()
+                .map(|g| g.data.nodes.clone())
+                .unwrap_or_default();
+            let active_sessions: Vec<QuicPeerSession> = hub
+                .sessions
+                .read()
+                .map(|s| s.values().cloned().collect())
+                .unwrap_or_default();
+            for sess in active_sessions {
+                let frame = ReliableControlFrame::TopologySync {
+                    nodes: nodes_copy.clone(),
+                };
+                tauri::async_runtime::spawn(async move {
+                    let _ = sess.send_reliable_frame(&frame, false).await;
+                });
             }
+
+            Ok(IpcEnvelope {
+                ok: true,
+                snapshot: Some(hub.build_snapshot()),
+                error: None,
+                swapped_with,
+                added_node: None,
+            })
         }
 
         "update_node_refresh_rate" => {
@@ -660,15 +624,18 @@ pub fn dispatch_daemon_ipc(
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
             let hz = payload.get("hz").and_then(|v| v.as_u64()).unwrap_or(120) as u16;
-            for n in &mut guard.data.nodes {
-                if n.id == node_id {
-                    n.refresh_rate_hz = hz;
+            {
+                let mut guard = hub.state.write().map_err(|e| e.to_string())?;
+                for n in &mut guard.data.nodes {
+                    if n.id == node_id {
+                        n.refresh_rate_hz = hz;
+                    }
                 }
             }
-            guard.persist();
+            hub.persist();
             Ok(IpcEnvelope {
                 ok: true,
-                snapshot: Some(guard.build_snapshot()),
+                snapshot: Some(hub.build_snapshot()),
                 error: None,
                 swapped_with: None,
                 added_node: None,
@@ -676,47 +643,69 @@ pub fn dispatch_daemon_ipc(
         }
 
         "update_engine_tuning" => {
-            if let Some(patch) = payload.get("tuning").and_then(|v| v.as_object()) {
-                if let Some(active) = patch.get("daemonActive").and_then(|v| v.as_bool()) {
-                    guard.data.tuning.daemon_active = active;
-                }
-                if let Some(hz) = patch.get("hidPollingHz").and_then(|v| v.as_u64()) {
-                    guard.data.tuning.hid_polling_hz = hz as u16;
-                }
-                if let Some(delay) = patch.get("edgeDelayMs").and_then(|v| v.as_u64()) {
-                    guard.data.tuning.edge_delay_ms = delay as u16;
-                }
-                if let Some(hotkey) = patch.get("releaseHotkey").and_then(|v| v.as_str()) {
-                    guard.data.tuning.release_hotkey = hotkey.to_string();
-                }
-                if let Some(strat_val) = patch.get("linuxWaylandStrategy") {
-                    if let Ok(strat) = serde_json::from_value::<LinuxWaylandStrategy>(strat_val.clone()) {
-                        guard.data.tuning.linux_wayland_strategy = strat;
+            let mut dock_changed: Option<bool> = None;
+            {
+                let mut guard = hub.state.write().map_err(|e| e.to_string())?;
+                if let Some(patch) = payload.get("tuning").and_then(|v| v.as_object()) {
+                    if let Some(v) = patch.get("daemonActive").and_then(|v| v.as_bool()) {
+                        guard.data.tuning.daemon_active = v;
+                    }
+                    if let Some(v) = patch.get("hidPollingHz").and_then(|v| v.as_u64()) {
+                        guard.data.tuning.hid_polling_hz = v as u16;
+                    }
+                    if let Some(v) = patch.get("edgeDelayMs").and_then(|v| v.as_u64()) {
+                        guard.data.tuning.edge_delay_ms = v as u16;
+                    }
+                    if let Some(v) = patch.get("releaseHotkey").and_then(|v| v.as_str()) {
+                        guard.data.tuning.release_hotkey = v.to_string();
+                    }
+                    if let Some(v) = patch.get("linuxWaylandStrategy").and_then(|v| v.as_str()) {
+                        guard.data.tuning.linux_wayland_strategy = match v {
+                            "portal-only" => LinuxWaylandStrategy::PortalOnly,
+                            _ => LinuxWaylandStrategy::PortalAndUinputFallback,
+                        };
+                    }
+                    if let Some(hide_dock) = patch.get("hideDockIcon").and_then(|v| v.as_bool()) {
+                        if guard.data.tuning.hide_dock_icon != hide_dock {
+                            guard.data.tuning.hide_dock_icon = hide_dock;
+                            dock_changed = Some(hide_dock);
+                        }
+                    }
+                    if let Some(name) = patch.get("localDeviceName").and_then(|v| v.as_str()) {
+                        let cleaned = name.trim();
+                        if !cleaned.is_empty() {
+                            guard.data.tuning.local_device_name = cleaned.to_string();
+                            let local_id = guard.data.local_node_id.clone();
+                            for n in &mut guard.data.nodes {
+                                if n.id == local_id {
+                                    n.name = cleaned.to_string();
+                                }
+                            }
+                        }
                     }
                 }
             }
-            guard.persist();
-            Ok(IpcEnvelope {
-                ok: true,
-                snapshot: Some(guard.build_snapshot()),
-                error: None,
-                swapped_with: None,
-                added_node: None,
-            })
-        }
 
-        "step_virtual_cursor" => {
-            if guard.data.tuning.daemon_active {
-                let dx = payload.get("dx").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-                let dy = payload.get("dy").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-                let next_cursor =
-                    step_cursor_normalized(&guard.data.nodes, &guard.data.cursor, dx, dy);
-                guard.data.cursor = next_cursor;
-                guard.persist();
+            if let Some(hide_dock) = dock_changed {
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = app_handle.set_dock_visibility(!hide_dock);
+                    if let Some(window) = app_handle.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = (&app_handle, hide_dock);
+                }
             }
+
+            hub.persist();
+            hub.sync_capture_edges();
             Ok(IpcEnvelope {
                 ok: true,
-                snapshot: Some(guard.build_snapshot()),
+                snapshot: Some(hub.build_snapshot()),
                 error: None,
                 swapped_with: None,
                 added_node: None,
@@ -724,31 +713,63 @@ pub fn dispatch_daemon_ipc(
         }
 
         "jump_cursor_to_node" => {
-            let node_id = payload
+            let target_id = payload
                 .get("nodeId")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            if guard.data.nodes.iter().any(|n| n.id == node_id) {
-                let changed = guard.data.cursor.active_node_id != node_id;
-                let next_count = if changed {
-                    guard.data.cursor.transition_count + 1
-                } else {
-                    guard.data.cursor.transition_count
+
+            let (local_id, target_sess) = {
+                let mut guard = hub.state.write().map_err(|e| e.to_string())?;
+                if !guard.data.nodes.iter().any(|n| n.id == target_id) {
+                    return Ok(IpcEnvelope {
+                        ok: false,
+                        snapshot: None,
+                        error: Some("目标屏幕不存在。".into()),
+                        swapped_with: None,
+                        added_node: None,
+                    });
+                }
+                if guard.cursor.active_node_id != target_id {
+                    guard.cursor.transition_count += 1;
+                }
+                guard.cursor.active_node_id = target_id.clone();
+                guard.cursor.x = 0.5;
+                guard.cursor.y = 0.5;
+                guard.router.active_node_id = target_id.clone();
+                guard.router.norm_x = 0.5;
+                guard.router.norm_y = 0.5;
+
+                let sess = hub
+                    .sessions
+                    .read()
+                    .ok()
+                    .and_then(|s| s.get(&target_id).cloned());
+                (guard.data.local_node_id.clone(), sess)
+            };
+
+            if target_id == local_id {
+                hub.capture_ctrl.set_suppressing(false);
+                if let Ok(mut inj_guard) = hub.injector.lock() {
+                    if let Some(ref mut inj) = *inj_guard {
+                        let _ = inj.inject_mouse_warp(0.5, 0.5);
+                    }
+                }
+            } else if let Some(sess) = target_sess {
+                hub.capture_ctrl.set_suppressing(true);
+                let frame = ReliableControlFrame::FocusEnter {
+                    node_id: target_id,
+                    normalized_x: 0.5,
+                    normalized_y: 0.5,
                 };
-                let prev_edge = guard.data.cursor.last_transition_edge.clone();
-                guard.data.cursor = VirtualCursorDto {
-                    active_node_id: node_id,
-                    x: 0.5,
-                    y: 0.5,
-                    transition_count: next_count,
-                    last_transition_edge: prev_edge,
-                };
-                guard.persist();
+                tauri::async_runtime::spawn(async move {
+                    let _ = sess.send_reliable_frame(&frame, true).await;
+                });
             }
+
             Ok(IpcEnvelope {
                 ok: true,
-                snapshot: Some(guard.build_snapshot()),
+                snapshot: Some(hub.build_snapshot()),
                 error: None,
                 swapped_with: None,
                 added_node: None,
@@ -756,73 +777,31 @@ pub fn dispatch_daemon_ipc(
         }
 
         "emergency_return_primary" => {
-            let primary_id = guard
-                .data
-                .nodes
-                .iter()
-                .find(|n| n.is_primary)
-                .or_else(|| guard.data.nodes.first())
-                .map(|n| n.id.clone())
+            hub.capture_ctrl.set_suppressing(false);
+            {
+                let mut guard = hub.state.write().map_err(|e| e.to_string())?;
+                let local_id = guard.data.local_node_id.clone();
+                let outcome = guard.router.force_return_to_primary(&local_id);
+                guard.cursor.active_node_id = outcome.active_node_id;
+                guard.cursor.x = 0.5;
+                guard.cursor.y = 0.5;
+                guard.cursor.last_transition_edge = None;
+            }
+            let sessions: Vec<QuicPeerSession> = hub
+                .sessions
+                .read()
+                .map(|s| s.values().cloned().collect())
                 .unwrap_or_default();
-            let changed = guard.data.cursor.active_node_id != primary_id;
-            let next_count = if changed {
-                guard.data.cursor.transition_count + 1
-            } else {
-                guard.data.cursor.transition_count
-            };
-            guard.data.cursor = VirtualCursorDto {
-                active_node_id: primary_id,
-                x: 0.5,
-                y: 0.5,
-                transition_count: next_count,
-                last_transition_edge: None,
-            };
-            guard.persist();
+            for sess in sessions {
+                tauri::async_runtime::spawn(async move {
+                    let _ = sess
+                        .send_reliable_frame(&ReliableControlFrame::ReleaseAllHeldKeys, true)
+                        .await;
+                });
+            }
             Ok(IpcEnvelope {
                 ok: true,
-                snapshot: Some(guard.build_snapshot()),
-                error: None,
-                swapped_with: None,
-                added_node: None,
-            })
-        }
-
-        "load_nine_preset" => {
-            let nine = nine_grid_preset();
-            let primary_id = nine
-                .iter()
-                .find(|n| n.is_primary)
-                .or_else(|| nine.first())
-                .map(|n| n.id.clone())
-                .unwrap_or_default();
-            guard.data.discovered_peers = default_discovered_peers()
-                .into_iter()
-                .filter(|p| !nine.iter().any(|n| n.id == p.id))
-                .collect();
-            guard.data.nodes = nine;
-            guard.data.cursor = VirtualCursorDto {
-                active_node_id: primary_id,
-                x: 0.5,
-                y: 0.5,
-                transition_count: 0,
-                last_transition_edge: None,
-            };
-            guard.persist();
-            Ok(IpcEnvelope {
-                ok: true,
-                snapshot: Some(guard.build_snapshot()),
-                error: None,
-                swapped_with: None,
-                added_node: None,
-            })
-        }
-
-        "reset_default_preset" => {
-            guard.data = create_default_persisted_data();
-            guard.persist();
-            Ok(IpcEnvelope {
-                ok: true,
-                snapshot: Some(guard.build_snapshot()),
+                snapshot: Some(hub.build_snapshot()),
                 error: None,
                 swapped_with: None,
                 added_node: None,
@@ -830,121 +809,187 @@ pub fn dispatch_daemon_ipc(
         }
 
         "rotate_ephemeral_pin" => {
-            let next_seed = guard
-                .data
-                .pin_seed
-                .wrapping_add(137_911 + ((now_epoch_millis() as u64) % 899));
-            guard.data.pin_seed = next_seed;
-            guard.persist();
+            {
+                let mut guard = hub.state.write().map_err(|e| e.to_string())?;
+                guard.data.pin_seed = guard
+                    .data
+                    .pin_seed
+                    .wrapping_add(137_911 + ((now_epoch_millis() as u64) % 899));
+            }
+            hub.persist();
             Ok(IpcEnvelope {
                 ok: true,
-                snapshot: Some(guard.build_snapshot()),
+                snapshot: Some(hub.build_snapshot()),
                 error: None,
                 swapped_with: None,
                 added_node: None,
             })
         }
 
-        "pair_peer_spake2" => {
+        "pair_peer_spake2" | "pair_by_ip_spake2" => {
             let pin_input = payload
                 .get("pinInput")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            if let Err(err) = validate_pin(pin_input) {
-                return Ok(IpcEnvelope {
-                    ok: false,
-                    snapshot: None,
-                    error: Some(err),
-                    swapped_with: None,
-                    added_node: None,
-                });
-            }
-            if guard.data.nodes.len() >= MAX_DEVICES {
-                return Ok(IpcEnvelope {
-                    ok: false,
-                    snapshot: None,
-                    error: Some(format!("最多支持 {MAX_DEVICES} 台电脑互联，当前已达到上限。")),
-                    swapped_with: None,
-                    added_node: None,
-                });
-            }
+            let normalized_pin = match validate_pin(pin_input) {
+                Ok(p) => p,
+                Err(err) => {
+                    return Ok(IpcEnvelope {
+                        ok: false,
+                        snapshot: None,
+                        error: Some(err),
+                        swapped_with: None,
+                        added_node: None,
+                    });
+                }
+            };
 
-            let peer_id = payload
-                .get("peerId")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
             let auto_pair = payload
                 .get("autoPair")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
 
-            let Some(peer_idx) = guard
-                .data
-                .discovered_peers
-                .iter()
-                .position(|p| p.id == peer_id)
-            else {
+            // Resolve target SocketAddr either from discovered peerId or manual IP:port
+            let target_addr: SocketAddr = if command == "pair_by_ip_spake2" {
+                let raw_ip = payload
+                    .get("ip")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .trim();
+                let port = payload
+                    .get("port")
+                    .and_then(|v| v.as_u64())
+                    .map(|p| p as u16)
+                    .unwrap_or(DEFAULT_QUIC_PORT);
+
+                if let Ok(sock_addr) = raw_ip.parse::<SocketAddr>() {
+                    sock_addr
+                } else if let Ok(ip_addr) = raw_ip.parse::<IpAddr>() {
+                    SocketAddr::new(ip_addr, port)
+                } else {
+                    return Ok(IpcEnvelope {
+                        ok: false,
+                        snapshot: None,
+                        error: Some("请输入有效的局域网 IPv4 地址（例如 192.168.1.25）。".into()),
+                        swapped_with: None,
+                        added_node: None,
+                    });
+                }
+            } else {
+                let peer_id = payload
+                    .get("peerId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let found = {
+                    let guard = hub.state.read().map_err(|e| e.to_string())?;
+                    guard
+                        .discovered_peers
+                        .iter()
+                        .find(|p| p.id == peer_id)
+                        .cloned()
+                };
+                let Some(peer) = found else {
+                    return Ok(IpcEnvelope {
+                        ok: false,
+                        snapshot: None,
+                        error: Some("该局域网设备已离线或不存在，请刷新扫描或使用 IP 直接配对。".into()),
+                        swapped_with: None,
+                        added_node: None,
+                    });
+                };
+                let ip: IpAddr = peer.ip.parse().map_err(|_| "无效的设备 IP 地址")?;
+                SocketAddr::new(ip, peer.quic_port)
+            };
+
+            let node_count = hub
+                .state
+                .read()
+                .map(|g| g.data.nodes.len())
+                .unwrap_or(0);
+            if node_count >= MAX_DEVICES {
                 return Ok(IpcEnvelope {
                     ok: false,
                     snapshot: None,
-                    error: Some("未找到待配对的局域网设备。".into()),
+                    error: Some(format!("最多支持 {MAX_DEVICES} 台电脑互联，当前已达上限。")),
+                    swapped_with: None,
+                    added_node: None,
+                });
+            }
+
+            let endpoint_opt = hub.quic_endpoint.read().ok().and_then(|g| g.clone());
+            let Some(endpoint) = endpoint_opt else {
+                return Ok(IpcEnvelope {
+                    ok: false,
+                    snapshot: None,
+                    error: Some("本地 QUIC 传输引擎尚未初始化完成。".into()),
                     swapped_with: None,
                     added_node: None,
                 });
             };
 
-            let Some(slot) = find_next_adjacent_slot(&guard.data.nodes) else {
-                return Ok(IpcEnvelope {
-                    ok: false,
-                    snapshot: None,
-                    error: Some("当前拓扑画布没有可用的相邻空闲槽位。".into()),
-                    swapped_with: None,
-                    added_node: None,
-                });
-            };
-
-            let peer = guard.data.discovered_peers.remove(peer_idx);
-            let digest = blake3::hash(
-                format!("{}:{}:{}", peer.id, pin_input, now_epoch_millis()).as_bytes(),
-            )
-            .to_hex()
-            .to_string()
-            .to_uppercase();
-            let fingerprint = format!(
-                "ED25519:{}:{}:{}:{}",
-                &digest[0..2],
-                &digest[2..4],
-                &digest[4..6],
-                &digest[6..8]
-            );
-
-            let new_node = DeviceNode {
-                id: peer.id,
-                name: peer.name,
-                hostname: peer.hostname,
-                os: peer.os,
-                ip: peer.ip,
-                resolution: peer.resolution,
-                refresh_rate_hz: peer.refresh_rate_hz,
-                is_primary: false,
-                grid_pos: slot,
+            let local_node = hub.local_node_descriptor();
+            match client_pair_spake2_over_quic(
+                &endpoint,
+                target_addr,
+                local_node,
+                &normalized_pin,
                 auto_pair,
-                online: true,
-                latency_ms: peer.latency_ms,
-                fingerprint,
-                paired_at: format!("今日 {}", &now_hms_string()[0..5]),
-            };
+            )
+            .await
+            {
+                Ok((session, mut remote_node)) => {
+                    let added = {
+                        let mut guard = hub.state.write().map_err(|e| e.to_string())?;
+                        let slot = find_next_adjacent_slot(&guard.data.nodes)
+                            .unwrap_or(GridPos { col: 3, row: 2 });
+                        remote_node.is_primary = false;
+                        remote_node.auto_pair = auto_pair;
+                        remote_node.online = true;
+                        remote_node.ip = target_addr.ip().to_string();
+                        remote_node.latency_ms = session.rtt_ms();
+                        remote_node.paired_at = format!("今日 {}", &now_hms_string()[0..5]);
+                        if let Some(existing) = guard
+                            .data
+                            .nodes
+                            .iter_mut()
+                            .find(|n| n.id == remote_node.id)
+                        {
+                            existing.ip = remote_node.ip.clone();
+                            existing.online = true;
+                            existing.auto_pair = auto_pair;
+                            existing.fingerprint = remote_node.fingerprint.clone();
+                            existing.clone()
+                        } else {
+                            remote_node.grid_pos = slot;
+                            guard.data.nodes.push(remote_node.clone());
+                            remote_node.clone()
+                        }
+                    };
 
-            guard.data.nodes.push(new_node.clone());
-            guard.persist();
+                    crate::runtime::register_and_spawn_peer_session(
+                        Arc::clone(&hub),
+                        app_handle.clone(),
+                        session,
+                    );
+                    hub.persist();
+                    hub.notify_frontend(&app_handle);
 
-            Ok(IpcEnvelope {
-                ok: true,
-                snapshot: Some(guard.build_snapshot()),
-                error: None,
-                swapped_with: None,
-                added_node: Some(new_node),
-            })
+                    Ok(IpcEnvelope {
+                        ok: true,
+                        snapshot: Some(hub.build_snapshot()),
+                        error: None,
+                        swapped_with: None,
+                        added_node: Some(added),
+                    })
+                }
+                Err(net_err) => Ok(IpcEnvelope {
+                    ok: false,
+                    snapshot: None,
+                    error: Some(net_err.to_string()),
+                    swapped_with: None,
+                    added_node: None,
+                }),
+            }
         }
 
         "toggle_auto_pair" => {
@@ -952,15 +997,18 @@ pub fn dispatch_daemon_ipc(
                 .get("nodeId")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            for n in &mut guard.data.nodes {
-                if n.id == node_id {
-                    n.auto_pair = !n.auto_pair;
+            {
+                let mut guard = hub.state.write().map_err(|e| e.to_string())?;
+                for n in &mut guard.data.nodes {
+                    if n.id == node_id {
+                        n.auto_pair = !n.auto_pair;
+                    }
                 }
             }
-            guard.persist();
+            hub.persist();
             Ok(IpcEnvelope {
                 ok: true,
-                snapshot: Some(guard.build_snapshot()),
+                snapshot: Some(hub.build_snapshot()),
                 error: None,
                 swapped_with: None,
                 added_node: None,
@@ -971,41 +1019,33 @@ pub fn dispatch_daemon_ipc(
             let node_id = payload
                 .get("nodeId")
                 .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            if let Some(pos) = guard
-                .data
-                .nodes
-                .iter()
-                .position(|n| n.id == node_id && !n.is_primary)
+                .unwrap_or_default()
+                .to_string();
+
+            if let Ok(mut sessions) = hub.sessions.write() {
+                if let Some(sess) = sessions.remove(&node_id) {
+                    sess.connection.close(quinn::VarInt::from_u32(200), b"unpaired");
+                }
+            }
+
             {
-                let removed = guard.data.nodes.remove(pos);
-                guard.data.discovered_peers.insert(
-                    0,
-                    DiscoveredPeerDto {
-                        id: removed.id.clone(),
-                        name: removed.name,
-                        hostname: removed.hostname,
-                        os: removed.os,
-                        ip: removed.ip,
-                        resolution: removed.resolution,
-                        refresh_rate_hz: removed.refresh_rate_hz,
-                        latency_ms: removed.latency_ms,
-                        fingerprint: removed.fingerprint,
-                    },
-                );
-                if guard.data.cursor.active_node_id == removed.id {
-                    let fallback_id = guard.data.nodes.first().map(|n| n.id.clone());
-                    if let Some(first_id) = fallback_id {
-                        guard.data.cursor.active_node_id = first_id;
-                        guard.data.cursor.x = 0.5;
-                        guard.data.cursor.y = 0.5;
+                let mut guard = hub.state.write().map_err(|e| e.to_string())?;
+                let local_id = guard.data.local_node_id.clone();
+                if node_id != local_id {
+                    guard.data.nodes.retain(|n| n.id != node_id);
+                    if guard.cursor.active_node_id == node_id {
+                        guard.cursor.active_node_id = local_id;
+                        guard.cursor.x = 0.5;
+                        guard.cursor.y = 0.5;
+                        hub.capture_ctrl.set_suppressing(false);
                     }
                 }
-                guard.persist();
             }
+            hub.persist();
+            hub.sync_capture_edges();
             Ok(IpcEnvelope {
                 ok: true,
-                snapshot: Some(guard.build_snapshot()),
+                snapshot: Some(hub.build_snapshot()),
                 error: None,
                 swapped_with: None,
                 added_node: None,
@@ -1068,39 +1108,45 @@ pub fn dispatch_daemon_ipc(
                     added_node: None,
                 });
             }
-            let duplicate = guard.data.key_rules.iter().any(|r| {
-                r.source_key == source_key
-                    && (r.target_os == target_os || r.target_os == "all" || target_os == "all")
-            });
-            if duplicate {
-                return Ok(IpcEnvelope {
-                    ok: false,
-                    snapshot: None,
-                    error: Some("该系统范围下已存在相同源按键的映射规则，请先停用或删除旧规则。".into()),
-                    swapped_with: None,
-                    added_node: None,
-                });
-            }
 
-            guard.data.key_rules.insert(
-                0,
-                KeyMappingRule {
-                    id: format!("rule-{}", now_epoch_millis()),
-                    label: if label.is_empty() {
-                        format!("{source_key} → {target_key}")
-                    } else {
-                        label
+            {
+                let mut guard = hub.state.write().map_err(|e| e.to_string())?;
+                let duplicate = guard.data.key_rules.iter().any(|r| {
+                    r.source_key == source_key
+                        && (r.target_os == target_os || r.target_os == "all" || target_os == "all")
+                });
+                if duplicate {
+                    return Ok(IpcEnvelope {
+                        ok: false,
+                        snapshot: None,
+                        error: Some(
+                            "该系统范围下已存在相同源按键的映射规则，请先删除旧规则。".into(),
+                        ),
+                        swapped_with: None,
+                        added_node: None,
+                    });
+                }
+
+                guard.data.key_rules.insert(
+                    0,
+                    KeyMappingRule {
+                        id: format!("rule-{}", now_epoch_millis()),
+                        label: if label.is_empty() {
+                            format!("{source_key} → {target_key}")
+                        } else {
+                            label
+                        },
+                        target_os,
+                        source_key,
+                        target_key,
+                        enabled,
                     },
-                    target_os,
-                    source_key,
-                    target_key,
-                    enabled,
-                },
-            );
-            guard.persist();
+                );
+            }
+            hub.persist();
             Ok(IpcEnvelope {
                 ok: true,
-                snapshot: Some(guard.build_snapshot()),
+                snapshot: Some(hub.build_snapshot()),
                 error: None,
                 swapped_with: None,
                 added_node: None,
@@ -1112,15 +1158,18 @@ pub fn dispatch_daemon_ipc(
                 .get("ruleId")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            for r in &mut guard.data.key_rules {
-                if r.id == rule_id {
-                    r.enabled = !r.enabled;
+            {
+                let mut guard = hub.state.write().map_err(|e| e.to_string())?;
+                for r in &mut guard.data.key_rules {
+                    if r.id == rule_id {
+                        r.enabled = !r.enabled;
+                    }
                 }
             }
-            guard.persist();
+            hub.persist();
             Ok(IpcEnvelope {
                 ok: true,
-                snapshot: Some(guard.build_snapshot()),
+                snapshot: Some(hub.build_snapshot()),
                 error: None,
                 swapped_with: None,
                 added_node: None,
@@ -1132,11 +1181,14 @@ pub fn dispatch_daemon_ipc(
                 .get("ruleId")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            guard.data.key_rules.retain(|r| r.id != rule_id);
-            guard.persist();
+            {
+                let mut guard = hub.state.write().map_err(|e| e.to_string())?;
+                guard.data.key_rules.retain(|r| r.id != rule_id);
+            }
+            hub.persist();
             Ok(IpcEnvelope {
                 ok: true,
-                snapshot: Some(guard.build_snapshot()),
+                snapshot: Some(hub.build_snapshot()),
                 error: None,
                 swapped_with: None,
                 added_node: None,
@@ -1144,88 +1196,266 @@ pub fn dispatch_daemon_ipc(
         }
 
         "update_clipboard_policy" => {
-            if let Some(patch) = payload.get("policy").and_then(|v| v.as_object()) {
-                if let Some(v) = patch.get("syncPlainText").and_then(|v| v.as_bool()) {
-                    guard.data.clipboard_policy.sync_plain_text = v;
-                }
-                if let Some(v) = patch.get("syncImages").and_then(|v| v.as_bool()) {
-                    guard.data.clipboard_policy.sync_images = v;
-                }
-                if let Some(v) = patch.get("enableDragDropFile").and_then(|v| v.as_bool()) {
-                    guard.data.clipboard_policy.enable_drag_drop_file = v;
-                }
-                if let Some(v) = patch.get("maxFileSizeMb").and_then(|v| v.as_u64()) {
-                    guard.data.clipboard_policy.max_file_size_mb = v as u32;
-                }
-                if let Some(v) = patch.get("saveDir").and_then(|v| v.as_str()) {
-                    guard.data.clipboard_policy.save_dir = v.to_string();
+            {
+                let mut guard = hub.state.write().map_err(|e| e.to_string())?;
+                if let Some(patch) = payload.get("policy").and_then(|v| v.as_object()) {
+                    if let Some(v) = patch.get("syncPlainText").and_then(|v| v.as_bool()) {
+                        guard.data.clipboard_policy.sync_plain_text = v;
+                    }
+                    if let Some(v) = patch.get("syncImages").and_then(|v| v.as_bool()) {
+                        guard.data.clipboard_policy.sync_images = v;
+                    }
+                    if let Some(v) = patch.get("enableDragDropFile").and_then(|v| v.as_bool()) {
+                        guard.data.clipboard_policy.enable_drag_drop_file = v;
+                    }
+                    if let Some(v) = patch.get("maxFileSizeMb").and_then(|v| v.as_u64()) {
+                        guard.data.clipboard_policy.max_file_size_mb = v as u32;
+                    }
+                    if let Some(v) = patch.get("saveDir").and_then(|v| v.as_str()) {
+                        guard.data.clipboard_policy.save_dir = v.to_string();
+                    }
                 }
             }
-            guard.persist();
+            hub.persist();
             Ok(IpcEnvelope {
                 ok: true,
-                snapshot: Some(guard.build_snapshot()),
+                snapshot: Some(hub.build_snapshot()),
                 error: None,
                 swapped_with: None,
                 added_node: None,
             })
         }
 
-        "push_transfer_record" => {
-            if let Some(rec) = payload.get("record") {
-                let title = rec
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("跨屏同步内容")
-                    .to_string();
-                let size_label = rec
-                    .get("sizeLabel")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("0 B")
-                    .to_string();
-                let digest = blake3::hash(
-                    format!("{title}:{size_label}:{}", now_epoch_millis()).as_bytes(),
-                )
-                .to_hex()
+        "broadcast_clipboard_text" => {
+            let text = payload
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
                 .to_string();
-
-                let new_rec = TransferRecordDto {
-                    id: format!("tr-{}", now_epoch_millis()),
-                    record_type: rec
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("clipboard-text")
-                        .to_string(),
-                    title,
-                    size_label,
-                    from_node_name: rec
-                        .get("fromNodeName")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    to_node_name: rec
-                        .get("toNodeName")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    timestamp: now_hms_string(),
-                    encrypted: rec
-                        .get("encrypted")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true),
-                    status: rec
-                        .get("status")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("completed")
-                        .to_string(),
-                    digest_hex: Some(digest[0..16].to_string()),
-                };
-                guard.data.transfers.insert(0, new_rec);
-                guard.persist();
+            if text.trim().is_empty() {
+                return Ok(IpcEnvelope {
+                    ok: false,
+                    snapshot: None,
+                    error: Some("剪贴板文本内容不能为空。".into()),
+                    swapped_with: None,
+                    added_node: None,
+                });
             }
+
+            // Write directly to local OS clipboard AND broadcast to all connected QUIC peers
+            let _ = write_os_clipboard_text(&text);
+            let digest = compute_chunk_blake3_hex(text.as_bytes());
+
+            let active_sessions: Vec<QuicPeerSession> = hub
+                .sessions
+                .read()
+                .map(|s| s.values().cloned().collect())
+                .unwrap_or_default();
+            let peer_count = active_sessions.len();
+
+            for sess in active_sessions {
+                let frame = ReliableControlFrame::ClipboardSync {
+                    mime: "text/plain;charset=utf-8".into(),
+                    blake3_hex: digest.clone(),
+                    text: Some(text.clone()),
+                    image: None,
+                };
+                tauri::async_runtime::spawn(async move {
+                    let _ = sess.send_reliable_frame(&frame, false).await;
+                });
+            }
+
+            {
+                let mut guard = hub.state.write().map_err(|e| e.to_string())?;
+                guard.last_synced_clipboard_hash = digest.clone();
+                let from_name = guard.data.tuning.local_device_name.clone();
+                let to_label = if peer_count > 0 {
+                    format!("已同步至 {peer_count} 台在线设备")
+                } else {
+                    "本机系统剪贴板（暂无在线远端设备）".into()
+                };
+                let title = if text.chars().count() > 48 {
+                    let prefix: String = text.chars().take(48).collect();
+                    format!("{prefix}...")
+                } else {
+                    text.clone()
+                };
+                guard.data.transfers.insert(
+                    0,
+                    TransferRecordDto {
+                        id: format!("tr-{}", now_epoch_millis()),
+                        record_type: "clipboard-text".into(),
+                        title,
+                        size_label: format_bytes_human(text.len()),
+                        from_node_name: from_name,
+                        to_node_name: to_label,
+                        timestamp: now_hms_string(),
+                        encrypted: true,
+                        status: "completed".into(),
+                        digest_hex: Some(digest[0..16].to_string()),
+                    },
+                );
+            }
+            hub.persist();
             Ok(IpcEnvelope {
                 ok: true,
-                snapshot: Some(guard.build_snapshot()),
+                snapshot: Some(hub.build_snapshot()),
+                error: None,
+                swapped_with: None,
+                added_node: None,
+            })
+        }
+
+        "send_file_payload" => {
+            let file_name = payload
+                .get("fileName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("transfer.bin")
+                .to_string();
+            let target_node_id = payload
+                .get("targetNodeId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let b64 = payload
+                .get("base64Data")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+
+            let bytes = match decode_base64(b64) {
+                Ok(b) => b,
+                Err(e) => {
+                    return Ok(IpcEnvelope {
+                        ok: false,
+                        snapshot: None,
+                        error: Some(format!("文件编码解析失败: {e}")),
+                        swapped_with: None,
+                        added_node: None,
+                    });
+                }
+            };
+
+            let (local_id, local_name, max_mb, save_dir, target_name) = {
+                let guard = hub.state.read().map_err(|e| e.to_string())?;
+                if !guard.data.clipboard_policy.enable_drag_drop_file {
+                    return Ok(IpcEnvelope {
+                        ok: false,
+                        snapshot: None,
+                        error: Some("文件拖拽传输开关当前已关闭，请先开启后再发送。".into()),
+                        swapped_with: None,
+                        added_node: None,
+                    });
+                }
+                let tname = guard
+                    .data
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == target_node_id)
+                    .map(|n| n.name.clone())
+                    .unwrap_or_else(|| "目标设备".into());
+                (
+                    guard.data.local_node_id.clone(),
+                    guard.data.tuning.local_device_name.clone(),
+                    guard.data.clipboard_policy.max_file_size_mb,
+                    guard.data.clipboard_policy.save_dir.clone(),
+                    tname,
+                )
+            };
+
+            if bytes.len() > (max_mb as usize) * 1024 * 1024 {
+                return Ok(IpcEnvelope {
+                    ok: false,
+                    snapshot: None,
+                    error: Some(format!("文件大小超过当前设置的 {max_mb} MB 上限。")),
+                    swapped_with: None,
+                    added_node: None,
+                });
+            }
+
+            let full_digest = compute_chunk_blake3_hex(&bytes);
+            let safe_name = PathBuf::from(&file_name)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "file.bin".into());
+
+            if target_node_id.is_empty() || target_node_id == local_id {
+                // Save into local receive folder for local verification
+                let out_dir = expand_save_dir(&save_dir);
+                let _ = fs::create_dir_all(&out_dir);
+                let out_path = out_dir.join(&safe_name);
+                fs::write(&out_path, &bytes)
+                    .map_err(|e| format!("写入本地接收目录失败: {e}"))?;
+            } else {
+                let sess_opt = hub
+                    .sessions
+                    .read()
+                    .ok()
+                    .and_then(|s| s.get(&target_node_id).cloned());
+                let Some(sess) = sess_opt else {
+                    return Ok(IpcEnvelope {
+                        ok: false,
+                        snapshot: None,
+                        error: Some(format!(
+                            "目标设备「{target_name}」当前未建立活跃加密连接，请确认两台电脑在线。"
+                        )),
+                        swapped_with: None,
+                        added_node: None,
+                    });
+                };
+
+                let transfer_id = format!("xf-{}", now_epoch_millis());
+                let chunks: Vec<&[u8]> = if bytes.is_empty() {
+                    vec![&[]]
+                } else {
+                    bytes.chunks(FILE_CHUNK_SIZE).collect()
+                };
+                let total_chunks = chunks.len() as u32;
+                let total_bytes = bytes.len() as u64;
+
+                for (idx, chunk) in chunks.into_iter().enumerate() {
+                    let frame = ReliableControlFrame::FileChunk {
+                        transfer_id: transfer_id.clone(),
+                        file_name: safe_name.clone(),
+                        chunk_index: idx as u32,
+                        total_chunks,
+                        total_bytes,
+                        chunk_blake3_hex: compute_chunk_blake3_hex(chunk),
+                        bytes_b64: encode_base64(chunk),
+                    };
+                    if let Err(err) = sess.send_reliable_frame(&frame, false).await {
+                        return Ok(IpcEnvelope {
+                            ok: false,
+                            snapshot: None,
+                            error: Some(format!("文件分块传输中断: {err}")),
+                            swapped_with: None,
+                            added_node: None,
+                        });
+                    }
+                }
+            }
+
+            {
+                let mut guard = hub.state.write().map_err(|e| e.to_string())?;
+                guard.data.transfers.insert(
+                    0,
+                    TransferRecordDto {
+                        id: format!("tr-{}", now_epoch_millis()),
+                        record_type: "file-drop".into(),
+                        title: safe_name,
+                        size_label: format_bytes_human(bytes.len()),
+                        from_node_name: local_name,
+                        to_node_name: target_name,
+                        timestamp: now_hms_string(),
+                        encrypted: true,
+                        status: "completed".into(),
+                        digest_hex: Some(full_digest[0..16].to_string()),
+                    },
+                );
+            }
+            hub.persist();
+            Ok(IpcEnvelope {
+                ok: true,
+                snapshot: Some(hub.build_snapshot()),
                 error: None,
                 swapped_with: None,
                 added_node: None,
@@ -1233,11 +1463,14 @@ pub fn dispatch_daemon_ipc(
         }
 
         "clear_transfer_records" => {
-            guard.data.transfers.clear();
-            guard.persist();
+            {
+                let mut guard = hub.state.write().map_err(|e| e.to_string())?;
+                guard.data.transfers.clear();
+            }
+            hub.persist();
             Ok(IpcEnvelope {
                 ok: true,
-                snapshot: Some(guard.build_snapshot()),
+                snapshot: Some(hub.build_snapshot()),
                 error: None,
                 swapped_with: None,
                 added_node: None,
@@ -1252,149 +1485,4 @@ pub fn dispatch_daemon_ipc(
             added_node: None,
         }),
     }
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkspaceFileEntryDto {
-    pub path: String,
-    pub category: String,
-    pub summary: String,
-    pub line_count: usize,
-    pub byte_size: usize,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkspaceFileDetailDto {
-    pub path: String,
-    pub category: String,
-    pub summary: String,
-    pub content: String,
-}
-
-const EMBEDDED_WORKSPACE_SOURCES: &[(&str, &str, &str, &str)] = &[
-    (
-        ".github/workflows/build.yml",
-        "GitHub Actions CI/CD",
-        "Windows / macOS (ARM64 + Intel) / Linux 四端矩阵自动构建与 Artifacts 产物直出",
-        include_str!("../../.github/workflows/build.yml"),
-    ),
-    (
-        "Cargo.toml",
-        "Rust Workspace",
-        "Cargo Workspace 根清单与统一依赖锁",
-        include_str!("../../Cargo.toml"),
-    ),
-    (
-        "crates/spankvm-proto/src/lib.rs",
-        "spankvm-proto",
-        "14B 高速指针数据报编解码与跨端共享协议结构",
-        include_str!("../../crates/spankvm-proto/src/lib.rs"),
-    ),
-    (
-        "crates/spankvm-core/src/lib.rs",
-        "spankvm-core",
-        "最多 9 屏正交连通求解、跨屏焦点跟随、防粘连看门狗与键位映射",
-        include_str!("../../crates/spankvm-core/src/lib.rs"),
-    ),
-    (
-        "crates/spankvm-pal/src/lib.rs",
-        "spankvm-pal",
-        "跨平台输入捕获与低延迟注入抽象层 Trait",
-        include_str!("../../crates/spankvm-pal/src/lib.rs"),
-    ),
-    (
-        "crates/spankvm-pal/src/linux_wayland.rs",
-        "spankvm-pal (Wayland)",
-        "确认项 B：Wayland Portal (ashpd + libei) + /dev/uinput + X11 双栈驱动",
-        include_str!("../../crates/spankvm-pal/src/linux_wayland.rs"),
-    ),
-    (
-        "crates/spankvm-pal/src/macos.rs",
-        "spankvm-pal (macOS)",
-        "macOS CoreGraphics CGEventTap 捕获冻结与 CGEventPost 注入",
-        include_str!("../../crates/spankvm-pal/src/macos.rs"),
-    ),
-    (
-        "crates/spankvm-pal/src/windows.rs",
-        "spankvm-pal (Windows)",
-        "Windows RawInput 1000Hz 无加速增量捕获与 SendInput 扫描码注入",
-        include_str!("../../crates/spankvm-pal/src/windows.rs"),
-    ),
-    (
-        "crates/spankvm-net/src/lib.rs",
-        "spankvm-net",
-        "纯局域网围栏、SPAKE2 6 位临时码协商与 Quinn QUIC 双通道传输",
-        include_str!("../../crates/spankvm-net/src/lib.rs"),
-    ),
-    (
-        "src-tauri/tauri.conf.json",
-        "Tauri v2",
-        "确认项 A：Tauri v2 桌面窗口、打包配置与安全策略",
-        include_str!("../tauri.conf.json"),
-    ),
-    (
-        "src-tauri/Cargo.toml",
-        "Tauri v2",
-        "Tauri v2 宿主依赖配置与系统托盘特性",
-        include_str!("../Cargo.toml"),
-    ),
-    (
-        "src-tauri/src/lib.rs",
-        "Tauri v2",
-        "Tauri v2 应用生命周期与关闭窗口转入后台托盘守护",
-        include_str!("lib.rs"),
-    ),
-    (
-        "src-tauri/src/commands.rs",
-        "Tauri v2",
-        "Tauri v2 #[tauri::command] 前端全量 IPC 桥接处理器",
-        include_str!("commands.rs"),
-    ),
-    (
-        "scripts/setup-linux-uinput.sh",
-        "Linux 辅助脚本",
-        "Linux Wayland 后备 /dev/uinput 免 root udev 权限一键配置脚本",
-        include_str!("../../scripts/setup-linux-uinput.sh"),
-    ),
-    (
-        "src/data/seedData.ts",
-        "前端拓扑预设数据",
-        "默认 4 屏 / 9 屏九宫格拓扑预设与按键映射种子配置",
-        include_str!("../../src/data/seedData.ts"),
-    ),
-    (
-        "README.md",
-        "构建文档",
-        "macOS / Windows / Linux Wayland 本地编译与打包说明",
-        include_str!("../../README.md"),
-    ),
-];
-
-#[tauri::command]
-pub fn get_workspace_files() -> Vec<WorkspaceFileEntryDto> {
-    EMBEDDED_WORKSPACE_SOURCES
-        .iter()
-        .map(|(path, category, summary, content)| WorkspaceFileEntryDto {
-            path: (*path).to_string(),
-            category: (*category).to_string(),
-            summary: (*summary).to_string(),
-            line_count: content.lines().count(),
-            byte_size: content.len(),
-        })
-        .collect()
-}
-
-#[tauri::command]
-pub fn get_workspace_file(file_path: String) -> Option<WorkspaceFileDetailDto> {
-    EMBEDDED_WORKSPACE_SOURCES
-        .iter()
-        .find(|(path, _, _, _)| *path == file_path)
-        .map(|(path, category, summary, content)| WorkspaceFileDetailDto {
-            path: (*path).to_string(),
-            category: (*category).to_string(),
-            summary: (*summary).to_string(),
-            content: (*content).to_string(),
-        })
 }

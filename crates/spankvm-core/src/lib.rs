@@ -34,10 +34,18 @@ pub fn compute_neighbors<'a>(nodes: &'a [DeviceNode], node_id: &str) -> Neighbor
     let GridPos { col, row } = origin.grid_pos;
 
     NeighborSet {
-        up: nodes.iter().find(|n| n.grid_pos.col == col && n.grid_pos.row == row - 1),
-        down: nodes.iter().find(|n| n.grid_pos.col == col && n.grid_pos.row == row + 1),
-        left: nodes.iter().find(|n| n.grid_pos.col == col - 1 && n.grid_pos.row == row),
-        right: nodes.iter().find(|n| n.grid_pos.col == col + 1 && n.grid_pos.row == row),
+        up: nodes
+            .iter()
+            .find(|n| n.grid_pos.col == col && n.grid_pos.row == row - 1),
+        down: nodes
+            .iter()
+            .find(|n| n.grid_pos.col == col && n.grid_pos.row == row + 1),
+        left: nodes
+            .iter()
+            .find(|n| n.grid_pos.col == col - 1 && n.grid_pos.row == row),
+        right: nodes
+            .iter()
+            .find(|n| n.grid_pos.col == col + 1 && n.grid_pos.row == row),
     }
 }
 
@@ -56,8 +64,8 @@ pub fn is_topology_connected(nodes: &[DeviceNode]) -> bool {
             if visited.contains(cand.id.as_str()) {
                 continue;
             }
-            let manhattan =
-                (cand.grid_pos.col - curr.grid_pos.col).abs() + (cand.grid_pos.row - curr.grid_pos.row).abs();
+            let manhattan = (cand.grid_pos.col - curr.grid_pos.col).abs()
+                + (cand.grid_pos.row - curr.grid_pos.row).abs();
             if manhattan == 1 {
                 visited.insert(cand.id.as_str());
                 queue.push_back(cand);
@@ -66,6 +74,34 @@ pub fn is_topology_connected(nodes: &[DeviceNode]) -> bool {
     }
 
     visited.len() == nodes.len()
+}
+
+pub fn find_next_adjacent_slot(nodes: &[DeviceNode]) -> Option<GridPos> {
+    if nodes.is_empty() {
+        return Some(GridPos { col: 2, row: 2 });
+    }
+    let occupied: HashSet<(i32, i32)> = nodes
+        .iter()
+        .map(|n| (n.grid_pos.col, n.grid_pos.row))
+        .collect();
+    let dirs = [(1, 0), (-1, 0), (0, -1), (0, 1)];
+
+    let mut ordered: Vec<&DeviceNode> = nodes.iter().collect();
+    ordered.sort_by_key(|n| if n.is_primary { 0 } else { 1 });
+
+    for base in ordered {
+        for (dc, dr) in dirs {
+            let col = base.grid_pos.col + dc;
+            let row = base.grid_pos.row + dr;
+            if (0..GRID_COLS).contains(&col)
+                && (0..GRID_ROWS).contains(&row)
+                && !occupied.contains(&(col, row))
+            {
+                return Some(GridPos { col, row });
+            }
+        }
+    }
+    None
 }
 
 pub fn set_primary_node(nodes: &mut [DeviceNode], primary_id: &str) -> Result<(), TopologyError> {
@@ -119,6 +155,7 @@ pub struct FocusRouter {
     pub norm_x: f32,
     pub norm_y: f32,
     pub held_scancodes: HashSet<u16>,
+    pub held_symbolic_keys: HashSet<String>,
     pub transition_count: u64,
 }
 
@@ -128,9 +165,9 @@ pub struct CursorStepOutcome {
     pub active_node_id: String,
     pub norm_x: f32,
     pub norm_y: f32,
-    /// Scancodes that must receive immediate synthetic KeyUp on `previous_node_id`
-    /// so modifier keys never stick when focus follows mouse to another computer.
+    pub crossed_edge: Option<&'static str>,
     pub synthetic_keyups_for_previous: Vec<u16>,
+    pub synthetic_symbolic_keyups: Vec<String>,
 }
 
 impl FocusRouter {
@@ -140,6 +177,7 @@ impl FocusRouter {
             norm_x: 0.5,
             norm_y: 0.5,
             held_scancodes: HashSet::new(),
+            held_symbolic_keys: HashSet::new(),
             transition_count: 0,
         }
     }
@@ -152,9 +190,18 @@ impl FocusRouter {
         }
     }
 
+    pub fn record_symbolic_key(&mut self, symbolic: &str, pressed: bool) {
+        if pressed {
+            self.held_symbolic_keys.insert(symbolic.to_string());
+        } else {
+            self.held_symbolic_keys.remove(symbolic);
+        }
+    }
+
     pub fn force_return_to_primary(&mut self, primary_id: &str) -> CursorStepOutcome {
         let prev = self.active_node_id.clone();
         let released: Vec<u16> = self.held_scancodes.drain().collect();
+        let released_sym: Vec<String> = self.held_symbolic_keys.drain().collect();
         self.active_node_id = primary_id.to_string();
         self.norm_x = 0.5;
         self.norm_y = 0.5;
@@ -163,7 +210,9 @@ impl FocusRouter {
             active_node_id: self.active_node_id.clone(),
             norm_x: 0.5,
             norm_y: 0.5,
+            crossed_edge: None,
             synthetic_keyups_for_previous: released,
+            synthetic_symbolic_keyups: released_sym,
         }
     }
 
@@ -180,7 +229,9 @@ impl FocusRouter {
                 active_node_id: prev_id,
                 norm_x: self.norm_x,
                 norm_y: self.norm_y,
+                crossed_edge: None,
                 synthetic_keyups_for_previous: Vec::new(),
+                synthetic_symbolic_keyups: Vec::new(),
             };
         };
 
@@ -189,12 +240,14 @@ impl FocusRouter {
         let mut nx = self.norm_x + (dx_px / w);
         let mut ny = self.norm_y + (dy_px / h);
         let mut target_id = active.id.clone();
+        let mut crossed_edge: Option<&'static str> = None;
 
         let neighbors = compute_neighbors(nodes, &active.id);
         if nx < 0.0 {
             if let Some(left) = neighbors.left.filter(|n| n.online) {
                 target_id = left.id.clone();
                 nx = (1.0 + nx).clamp(0.02, 0.98);
+                crossed_edge = Some("left");
             } else {
                 nx = 0.0;
             }
@@ -202,6 +255,7 @@ impl FocusRouter {
             if let Some(right) = neighbors.right.filter(|n| n.online) {
                 target_id = right.id.clone();
                 nx = (nx - 1.0).clamp(0.02, 0.98);
+                crossed_edge = Some("right");
             } else {
                 nx = 1.0;
             }
@@ -212,6 +266,7 @@ impl FocusRouter {
             if let Some(up) = v_neighbors.up.filter(|n| n.online) {
                 target_id = up.id.clone();
                 ny = (1.0 + ny).clamp(0.02, 0.98);
+                crossed_edge = Some("up");
             } else {
                 ny = 0.0;
             }
@@ -219,15 +274,18 @@ impl FocusRouter {
             if let Some(down) = v_neighbors.down.filter(|n| n.online) {
                 target_id = down.id.clone();
                 ny = (ny - 1.0).clamp(0.02, 0.98);
+                crossed_edge = Some("down");
             } else {
                 ny = 1.0;
             }
         }
 
         let mut released = Vec::new();
+        let mut released_sym = Vec::new();
         if target_id != prev_id {
             self.transition_count += 1;
             released = self.held_scancodes.drain().collect();
+            released_sym = self.held_symbolic_keys.drain().collect();
         }
 
         self.active_node_id = target_id.clone();
@@ -239,7 +297,9 @@ impl FocusRouter {
             active_node_id: target_id,
             norm_x: self.norm_x,
             norm_y: self.norm_y,
+            crossed_edge,
             synthetic_keyups_for_previous: released,
+            synthetic_symbolic_keyups: released_sym,
         }
     }
 }
@@ -286,7 +346,10 @@ mod tests {
             hostname: format!("{id}.local"),
             os: OsKind::LinuxWayland,
             ip: "192.168.1.10".to_string(),
-            resolution: Resolution { width: 1920, height: 1080 },
+            resolution: Resolution {
+                width: 1920,
+                height: 1080,
+            },
             refresh_rate_hz: 144,
             is_primary: primary,
             grid_pos: GridPos { col, row },
@@ -305,11 +368,14 @@ mod tests {
             sample_node("right", 3, 2, false),
         ];
         let mut router = FocusRouter::new("primary");
-        router.record_key_state(29, true); // Left Ctrl held
+        router.record_key_state(29, true);
+        router.record_symbolic_key("Command (⌘)", true);
 
         let outcome = router.step_pointer_delta(&nodes, 1200.0, 0.0);
         assert_eq!(outcome.active_node_id, "right");
+        assert_eq!(outcome.crossed_edge, Some("right"));
         assert_eq!(outcome.synthetic_keyups_for_previous, vec![29]);
+        assert_eq!(outcome.synthetic_symbolic_keyups, vec!["Command (⌘)"]);
         assert!(router.held_scancodes.is_empty());
     }
 
@@ -323,4 +389,3 @@ mod tests {
         assert_eq!(err, TopologyError::DisconnectedIsland);
     }
 }
-

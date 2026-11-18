@@ -6,11 +6,13 @@ import {
   Trash2,
   Check,
   FolderOpen,
+  ExternalLink,
 } from 'lucide-react';
 import {
   ClipboardPolicy,
   DeviceNode,
   TransferRecord,
+  encodeArrayBufferToBase64,
   getOsLabel,
 } from '../utils/kvmEngine';
 
@@ -19,7 +21,13 @@ interface ClipboardTransferViewProps {
   policy: ClipboardPolicy;
   onUpdatePolicy: (patch: Partial<ClipboardPolicy>) => void;
   transfers: TransferRecord[];
-  onAddTransfer: (record: Omit<TransferRecord, 'id' | 'timestamp'>) => void;
+  onBroadcastClipboard: (text: string) => Promise<{ ok: boolean; error?: string }>;
+  onSendFilePayload: (
+    fileName: string,
+    targetNodeId: string,
+    base64Data: string
+  ) => Promise<{ ok: boolean; error?: string }>;
+  onOpenReceiveDir: () => Promise<void>;
   onClearTransfers: () => void;
 }
 
@@ -28,10 +36,11 @@ export const ClipboardTransferView: React.FC<ClipboardTransferViewProps> = ({
   policy,
   onUpdatePolicy,
   transfers,
-  onAddTransfer,
+  onBroadcastClipboard,
+  onSendFilePayload,
+  onOpenReceiveDir,
   onClearTransfers,
 }) => {
-  const primaryNode = nodes.find((n) => n.isPrimary) ?? nodes[0];
   const secondaryNodes = nodes.filter((n) => !n.isPrimary);
 
   const {
@@ -45,72 +54,87 @@ export const ClipboardTransferView: React.FC<ClipboardTransferViewProps> = ({
   const [targetNodeId, setTargetNodeId] = useState<string>(
     secondaryNodes[0]?.id ?? nodes[0]?.id ?? ''
   );
-  const [clipboardDraft, setClipboardDraft] = useState<string>(
-    'RUSTFLAGS="-C target-cpu=native" cargo build --release'
-  );
+  const [clipboardDraft, setClipboardDraft] = useState<string>('');
   const [logFilter, setLogFilter] = useState<'all' | 'clipboard' | 'file'>('all');
   const [isDraggingOver, setIsDraggingOver] = useState<boolean>(false);
-  const [statusNotice, setStatusNotice] = useState<string | null>(null);
+  const [isTransferring, setIsTransferring] = useState<boolean>(false);
+  const [statusNotice, setStatusNotice] = useState<{
+    tone: 'info' | 'error';
+    text: string;
+  } | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const targetNode =
     nodes.find((n) => n.id === targetNodeId) ?? secondaryNodes[0] ?? nodes[0];
 
-  const formatBytes = (bytes: number): string => {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  };
-
-  const handleBroadcastClipboard = (e: React.FormEvent) => {
+  const handleClipboardSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const trimmed = clipboardDraft.trim();
     if (!trimmed) {
-      setStatusNotice('请输入要跨设备同步的剪贴板文本内容。');
+      setStatusNotice({
+        tone: 'error',
+        text: '请输入要写入系统剪贴板并跨设备同步的文本内容。',
+      });
       return;
     }
-    if (!syncPlainText) {
-      setStatusNotice('纯文本剪贴板同步当前已关闭，请先在左侧开启。');
+    const res = await onBroadcastClipboard(trimmed);
+    if (!res.ok) {
+      setStatusNotice({
+        tone: 'error',
+        text: res.error ?? '剪贴板同步失败。',
+      });
       return;
     }
-    onAddTransfer({
-      type: 'clipboard-text',
-      title: trimmed.length > 52 ? `${trimmed.slice(0, 52)}...` : trimmed,
-      sizeLabel: formatBytes(new TextEncoder().encode(trimmed).length),
-      fromNodeName: primaryNode?.name ?? '本机主屏',
-      toNodeName: `局域网全部在线节点 (${nodes.length} 台)`,
-      encrypted: true,
-      status: 'completed',
+    setClipboardDraft('');
+    setStatusNotice({
+      tone: 'info',
+      text: '文本已写入本机剪贴板并通过 QUIC TLS 1.3 加密流同步至在线互联主机。',
     });
-    setStatusNotice('剪贴板内容已通过 TLS 1.3 可靠流同步至所有已连接屏幕。');
   };
 
-  const triggerFileDrop = (fileName: string, sizeLabel: string) => {
+  const handleFilesSelected = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
     if (!enableDragDropFile) {
-      setStatusNotice('跨屏幕文件拖拽传输当前处于关闭状态，请先开启开关。');
+      setStatusNotice({
+        tone: 'error',
+        text: '文件拖拽传输开关当前已关闭，请先在左侧开启后再发送文件。',
+      });
       return;
     }
     if (!targetNode) return;
-    onAddTransfer({
-      type: 'file-drop',
-      title: fileName,
-      sizeLabel,
-      fromNodeName: primaryNode?.name ?? '本机主屏',
-      toNodeName: targetNode.name,
-      encrypted: true,
-      status: 'completed',
-    });
-    setStatusNotice(
-      `文件「${fileName}」已通过 QUIC 分块加密流投递至 ${targetNode.name} (${saveDir})。`
-    );
-  };
 
-  const handleFilesSelected = (files: FileList | null) => {
-    if (!files || files.length === 0) return;
-    Array.from(files).forEach((file) => {
-      triggerFileDrop(file.name, formatBytes(file.size));
-    });
+    setIsTransferring(true);
+    try {
+      for (const file of Array.from(files)) {
+        if (file.size > maxFileSizeMb * 1024 * 1024) {
+          setStatusNotice({
+            tone: 'error',
+            text: `文件「${file.name}」超出单次传输上限 (${maxFileSizeMb} MB)。`,
+          });
+          continue;
+        }
+        const buf = await file.arrayBuffer();
+        const b64 = encodeArrayBufferToBase64(buf);
+        const res = await onSendFilePayload(file.name, targetNode.id, b64);
+        if (!res.ok) {
+          setStatusNotice({
+            tone: 'error',
+            text: res.error ?? `发送文件「${file.name}」失败。`,
+          });
+          return;
+        }
+        setStatusNotice({
+          tone: 'info',
+          text: `文件「${file.name}」已完成 BLAKE3 分块校验并投递至 ${targetNode.name}。`,
+        });
+      }
+    } finally {
+      setIsTransferring(false);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+    }
   };
 
   const filteredTransfers = transfers.filter((item) => {
@@ -126,58 +150,63 @@ export const ClipboardTransferView: React.FC<ClipboardTransferViewProps> = ({
           跨设备剪贴板同步与文件拖拽传输
         </h1>
         <p className="text-sm text-slate-600 dark:text-slate-400 mt-1">
-          剪贴板文本与截图自动双向镜像；按住鼠标左键将文件拖过屏幕边界即可触发局域网点对点 QUIC 加密分块直传。
+          后台守护进程自动监听各端操作系统剪贴板变更并双向同步；拖入本地文件可通过 QUIC 加密流分块直传至指定电脑并执行 BLAKE3 完整性校验。
         </p>
       </div>
 
       {statusNotice && (
         <div
           role="status"
-          className="px-4 py-2.5 rounded-lg border border-blue-200 dark:border-blue-900 bg-blue-50/70 dark:bg-blue-950/30 text-xs text-slate-800 dark:text-slate-200 flex items-center justify-between gap-4"
+          className={`px-4 py-2.5 rounded-lg border text-xs flex items-center justify-between gap-4 ${
+            statusNotice.tone === 'error'
+              ? 'border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-950/30 text-red-700 dark:text-red-300'
+              : 'border-blue-200 dark:border-blue-900 bg-blue-50/70 dark:bg-blue-950/30 text-slate-800 dark:text-slate-200'
+          }`}
         >
-          <span>{statusNotice}</span>
+          <span>{statusNotice.text}</span>
           <button
             type="button"
             onClick={() => setStatusNotice(null)}
             className="text-slate-500 hover:text-slate-800 dark:text-slate-400 whitespace-nowrap shrink-0"
           >
-            知道了
+            关闭提示
           </button>
         </div>
       )}
 
       <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
-        {/* Left 5 Cols: Sync Policy & Strategy */}
+        {/* Left 5 Cols: Sync Policy & Receive Folder */}
         <section
           aria-label="剪贴板与文件传输策略设置"
           className="xl:col-span-5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl divide-y divide-slate-200 dark:divide-slate-800"
         >
           <div className="p-5 space-y-3.5">
             <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
-              剪贴板与拖拽能力开关
+              自动同步与文件接收策略
             </h2>
 
             {[
               {
                 id: 'toggle-text',
-                title: '同步纯文本与代码片段 (UTF-8 / HTML)',
-                desc: '复制后焦点切入目标屏幕时零感按需拉取',
+                title: '自动同步系统纯文本剪贴板 (UTF-8)',
+                desc: '任意一台电脑复制文本后，其他在线电脑可直接粘贴',
                 checked: syncPlainText,
                 onToggle: () => onUpdatePolicy({ syncPlainText: !syncPlainText }),
               },
               {
                 id: 'toggle-img',
-                title: '同步剪贴板位图与屏幕截图 (PNG)',
-                desc: '跨系统自动转换 NSPasteboard / CF_DIB / Wayland MIME',
+                title: '同步剪贴板图像与屏幕截图 (RGBA / PNG)',
+                desc: '跨 macOS NSPasteboard / Windows / Wayland 自动转换格式',
                 checked: syncImages,
                 onToggle: () => onUpdatePolicy({ syncImages: !syncImages }),
               },
               {
                 id: 'toggle-drop',
-                title: '允许鼠标跨屏幕边缘直接拖拽文件传输',
-                desc: '使用 BLAKE3 块级完整性校验，断流支持自动续传',
+                title: '启用局域网加密文件拖拽直传',
+                desc: '64 KB 分块流式传输，逐块验证 BLAKE3 哈希摘要',
                 checked: enableDragDropFile,
-                onToggle: () => onUpdatePolicy({ enableDragDropFile: !enableDragDropFile }),
+                onToggle: () =>
+                  onUpdatePolicy({ enableDragDropFile: !enableDragDropFile }),
               },
             ].map((item) => (
               <div
@@ -215,27 +244,39 @@ export const ClipboardTransferView: React.FC<ClipboardTransferViewProps> = ({
                 htmlFor="max-file-limit"
                 className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5"
               >
-                单次拖拽传输大小上限
+                单次文件传输大小上限
               </label>
               <select
                 id="max-file-limit"
                 value={maxFileSizeMb}
-                onChange={(e) => onUpdatePolicy({ maxFileSizeMb: Number(e.target.value) })}
+                onChange={(e) =>
+                  onUpdatePolicy({ maxFileSizeMb: Number(e.target.value) })
+                }
                 className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 pl-3 pr-8 py-2 text-xs font-mono text-slate-900 dark:text-slate-100 tabular-nums"
               >
-                <option value={100}>100 MB (适合文档与常规压缩包)</option>
-                <option value={500}>500 MB (推荐默认值 · 局域网秒传)</option>
-                <option value={2048}>2048 MB (大体积构建产物与镜像)</option>
+                <option value={100}>100 MB (文档与常规代码包)</option>
+                <option value={500}>500 MB (推荐默认值)</option>
+                <option value={2048}>2048 MB (大体积安装包与镜像)</option>
               </select>
             </div>
 
             <div>
-              <label
-                htmlFor="receive-folder-input"
-                className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5"
-              >
-                落盘默认目录（未拖入具体窗口时保存位置）
-              </label>
+              <div className="flex items-center justify-between mb-1.5">
+                <label
+                  htmlFor="receive-folder-input"
+                  className="block text-xs font-medium text-slate-700 dark:text-slate-300"
+                >
+                  本机接收文件保存目录
+                </label>
+                <button
+                  type="button"
+                  onClick={onOpenReceiveDir}
+                  className="inline-flex items-center gap-1 text-xs text-blue-600 dark:text-blue-400 hover:underline whitespace-nowrap shrink-0"
+                >
+                  <ExternalLink className="w-3 h-3" />
+                  <span>打开接收目录</span>
+                </button>
+              </div>
               <div className="relative">
                 <FolderOpen className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
                 <input
@@ -250,26 +291,25 @@ export const ClipboardTransferView: React.FC<ClipboardTransferViewProps> = ({
           </div>
         </section>
 
-        {/* Right 7 Cols: Interactive File Drop & Shared Clipboard Tester */}
+        {/* Right 7 Cols: Real File Dropzone & Direct Clipboard Broadcast */}
         <div className="xl:col-span-7 space-y-6">
-          {/* Drag and Drop File Simulator */}
           <section
-            aria-label="跨屏幕文件拖拽投递演示"
+            aria-label="跨设备文件拖拽发送与剪贴板推送"
             className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 space-y-4"
           >
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div>
                 <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
-                  跨屏幕拖拽文件投递台
+                  拖拽发送本地文件至目标电脑
                 </h2>
                 <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                  选择接收主机并拖入本地文件（或点击下方示例文件一键测试加密传输流水）。
+                  将任意本地文件拖入下方区域（或点击选择文件），通过加密通道直接发送至选定设备的接收目录。
                 </p>
               </div>
 
               <div className="shrink-0">
                 <label htmlFor="drop-target-node" className="sr-only">
-                  选择拖拽接收目标电脑
+                  选择接收目标电脑
                 </label>
                 <select
                   id="drop-target-node"
@@ -279,7 +319,7 @@ export const ClipboardTransferView: React.FC<ClipboardTransferViewProps> = ({
                 >
                   {nodes.map((n) => (
                     <option key={n.id} value={n.id}>
-                      投递目标：{n.name} ({getOsLabel(n.os)})
+                      接收设备：{n.name} ({getOsLabel(n.os)})
                     </option>
                   ))}
                 </select>
@@ -305,10 +345,10 @@ export const ClipboardTransferView: React.FC<ClipboardTransferViewProps> = ({
             >
               <FileUp className="w-6 h-6 text-slate-400 mx-auto mb-2" />
               <p className="text-xs font-medium text-slate-700 dark:text-slate-200">
-                将文件拖拽至此处模拟跨屏幕边界松开鼠标，或选择本地文件发送至「{targetNode?.name}」
+                将本地文件拖拽至此处松开，直接加密发送至「{targetNode?.name}」
               </p>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 tabular-nums">
-                端到端 ChaCha20-Poly1305 加密 · 上限 {maxFileSizeMb} MB
+                QUIC TLS 1.3 + BLAKE3 分块完整性校验 · 单文件上限 {maxFileSizeMb} MB
               </p>
 
               <input
@@ -319,53 +359,41 @@ export const ClipboardTransferView: React.FC<ClipboardTransferViewProps> = ({
                 className="hidden"
               />
 
-              <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
+              <div className="mt-4 flex items-center justify-center">
                 <button
                   type="button"
+                  disabled={isTransferring}
                   onClick={() => fileInputRef.current?.click()}
-                  className="px-3.5 py-1.5 text-xs font-medium rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors whitespace-nowrap shrink-0"
+                  className="px-4 py-2 text-xs font-medium rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0"
                 >
-                  选择本地文件投递
-                </button>
-                <button
-                  type="button"
-                  onClick={() => triggerFileDrop('spankvm-driver-spec.pdf', '3.4 MB')}
-                  className="px-3 py-1.5 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
-                >
-                  模拟拖拽 spankvm-driver-spec.pdf
-                </button>
-                <button
-                  type="button"
-                  onClick={() => triggerFileDrop('macos-win-keymap.json', '12.8 KB')}
-                  className="px-3 py-1.5 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
-                >
-                  模拟拖拽 macos-win-keymap.json
+                  {isTransferring ? '正在加密传输中...' : '选择本地文件发送'}
                 </button>
               </div>
             </div>
 
-            {/* Live Clipboard Push Form */}
-            <form onSubmit={handleBroadcastClipboard} className="pt-2 space-y-2">
+            {/* Direct OS Clipboard Push Form */}
+            <form onSubmit={handleClipboardSubmit} className="pt-2 space-y-2">
               <label
                 htmlFor="shared-clipboard-input"
                 className="block text-xs font-medium text-slate-700 dark:text-slate-300"
               >
-                实时共享剪贴板缓冲区测试（模拟主屏 Cmd/Ctrl + C 复制同步）
+                主动推送文本至全局剪贴板（写入本机系统剪贴板并立即广播至所有在线设备）
               </label>
               <div className="flex gap-2">
                 <input
                   id="shared-clipboard-input"
                   type="text"
+                  placeholder="输入文本、终端命令或链接，一键同步到所有电脑剪贴板..."
                   value={clipboardDraft}
                   onChange={(e) => setClipboardDraft(e.target.value)}
-                  className="flex-1 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-xs font-mono text-slate-900 dark:text-slate-100"
+                  className="flex-1 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-xs font-mono text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-600"
                 />
                 <button
                   type="submit"
-                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 hover:opacity-90 transition-opacity whitespace-nowrap shrink-0"
+                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 hover:opacity-90 transition-opacity whitespace-nowrap shrink-0"
                 >
                   <Send className="w-3.5 h-3.5" />
-                  同步剪贴板
+                  <span>同步剪贴板</span>
                 </button>
               </div>
             </form>
@@ -381,8 +409,8 @@ export const ClipboardTransferView: React.FC<ClipboardTransferViewProps> = ({
         <div className="p-5 border-b border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-2">
             <Clipboard className="w-4 h-4 text-slate-500 shrink-0" />
-            <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
-              最近剪贴板同步与文件拖拽流水 ({filteredTransfers.length})
+            <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100 tabular-nums">
+              跨设备剪贴板与文件传输记录 ({filteredTransfers.length})
             </h2>
           </div>
 
@@ -391,7 +419,7 @@ export const ClipboardTransferView: React.FC<ClipboardTransferViewProps> = ({
               {(
                 [
                   { id: 'all', label: '全部记录' },
-                  { id: 'file', label: '文件拖拽' },
+                  { id: 'file', label: '文件传输' },
                   { id: 'clipboard', label: '剪贴板' },
                 ] as const
               ).map((tab) => (
@@ -417,7 +445,7 @@ export const ClipboardTransferView: React.FC<ClipboardTransferViewProps> = ({
                 className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs text-slate-500 hover:text-red-600 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-red-50 dark:hover:bg-red-950/30 transition-colors whitespace-nowrap shrink-0"
               >
                 <Trash2 className="w-3.5 h-3.5" />
-                清空记录
+                <span>清空记录</span>
               </button>
             )}
           </div>
@@ -429,7 +457,7 @@ export const ClipboardTransferView: React.FC<ClipboardTransferViewProps> = ({
               暂无跨设备传输记录
             </p>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              在上方点击「模拟拖拽 spankvm-driver-spec.pdf」或「同步剪贴板」即可查看实时加密传输流水。
+              在任意已连接电脑上复制文本，或将本地文件拖入上方发送区后，传输记录与 BLAKE3 校验摘要会实时显示在此处。
             </p>
           </div>
         ) : (
@@ -437,11 +465,11 @@ export const ClipboardTransferView: React.FC<ClipboardTransferViewProps> = ({
             <table className="w-full text-left border-collapse text-xs">
               <thead>
                 <tr className="border-b border-slate-200 dark:border-slate-800 text-slate-500 dark:text-slate-400">
-                  <th className="py-3 px-5 font-medium">内容摘要 / 文件名</th>
-                  <th className="py-3 px-4 font-medium">类型与体积</th>
-                  <th className="py-3 px-4 font-medium">流向路径</th>
-                  <th className="py-3 px-4 font-medium">安全状态</th>
-                  <th className="py-3 px-5 font-medium text-right">完成时间</th>
+                  <th className="py-3 px-5 font-medium whitespace-nowrap">内容摘要 / 文件名</th>
+                  <th className="py-3 px-4 font-medium whitespace-nowrap">类型与大小</th>
+                  <th className="py-3 px-4 font-medium whitespace-nowrap">传输方向</th>
+                  <th className="py-3 px-4 font-medium whitespace-nowrap">加密与完整性校验</th>
+                  <th className="py-3 px-5 font-medium text-right whitespace-nowrap">时间</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
@@ -453,21 +481,21 @@ export const ClipboardTransferView: React.FC<ClipboardTransferViewProps> = ({
                     <td className="py-3 px-5 font-mono text-slate-900 dark:text-slate-100">
                       {tr.title}
                     </td>
-                    <td className="py-3 px-4 text-slate-600 dark:text-slate-300 tabular-nums">
+                    <td className="py-3 px-4 text-slate-600 dark:text-slate-300 tabular-nums whitespace-nowrap">
                       {tr.type === 'file-drop'
-                        ? '跨屏文件拖拽'
+                        ? '文件传输'
                         : tr.type === 'clipboard-image'
-                        ? '剪贴板图像'
-                        : '剪贴板文本'}{' '}
+                          ? '剪贴板图像'
+                          : '剪贴板文本'}{' '}
                       · {tr.sizeLabel}
                     </td>
-                    <td className="py-3 px-4 text-slate-700 dark:text-slate-300">
+                    <td className="py-3 px-4 text-slate-700 dark:text-slate-300 whitespace-nowrap">
                       {tr.fromNodeName} → {tr.toNodeName}
                     </td>
                     <td className="py-3 px-4 text-slate-600 dark:text-slate-400 font-mono tabular-nums whitespace-nowrap">
                       TLS 1.3 · {tr.digestHex ? `摘要 ${tr.digestHex.slice(0, 8)}` : 'BLAKE3 已校验'}
                     </td>
-                    <td className="py-3 px-5 text-right font-mono text-slate-500 dark:text-slate-400 tabular-nums">
+                    <td className="py-3 px-5 text-right font-mono text-slate-500 dark:text-slate-400 tabular-nums whitespace-nowrap">
                       {tr.timestamp}
                     </td>
                   </tr>

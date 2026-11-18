@@ -14,7 +14,7 @@ export interface DeviceNode {
   os: OsKind;
   ip: string;
   resolution: { width: number; height: number };
-  refreshRateHz: 60 | 120 | 144 | 240 | 360;
+  refreshRateHz: number;
   isPrimary: boolean;
   gridPos: GridPos;
   autoPair: boolean;
@@ -30,10 +30,22 @@ export interface DiscoveredPeer {
   hostname: string;
   os: OsKind;
   ip: string;
+  quicPort?: number;
   resolution: { width: number; height: number };
-  refreshRateHz: 60 | 120 | 144 | 240 | 360;
+  refreshRateHz: number;
   latencyMs: number;
   fingerprint: string;
+}
+
+export interface LocalSystemStatus {
+  localNodeId: string;
+  localOs: OsKind;
+  localIp: string;
+  quicPort: number;
+  discoveryPort: number;
+  fingerprint: string;
+  inputPermissionGranted: boolean;
+  connectedPeerCount: number;
 }
 
 export interface NeighborMap {
@@ -83,6 +95,10 @@ export interface EngineTuning {
   edgeDelayMs: number;
   releaseHotkey: string;
   linuxWaylandStrategy: LinuxWaylandStrategy;
+  /** macOS configuration: hide Dock icon (defaults to false / NOT hidden) */
+  hideDockIcon: boolean;
+  /** Friendly hostname advertised on LAN discovery */
+  localDeviceName: string;
 }
 
 export interface ClipboardPolicy {
@@ -105,6 +121,8 @@ export interface FastPointerDatagramFrame {
 export const MAX_DEVICES = 9;
 export const GRID_COLS = 5;
 export const GRID_ROWS = 5;
+export const DEFAULT_QUIC_PORT = 24800;
+export const DISCOVERY_UDP_PORT = 24801;
 
 export function getOsFamily(os: OsKind): OsFamily {
   if (os === 'macos') return 'macos';
@@ -115,9 +133,9 @@ export function getOsFamily(os: OsKind): OsFamily {
 export function getOsLabel(os: OsKind): string {
   switch (os) {
     case 'macos':
-      return 'macOS 15';
+      return 'macOS';
     case 'windows':
-      return 'Windows 11';
+      return 'Windows';
     case 'linux-wayland':
       return 'Linux · Wayland';
     case 'linux-x11':
@@ -517,4 +535,72 @@ export function decodeFastPointerDatagram(bytes: Uint8Array): FastPointerDatagra
     dySubpx: view.getInt16(12, true),
   };
 }
+
+export function validateLanIpv4(rawIp: string): {
+  valid: boolean;
+  ip: string;
+  port?: number;
+  error?: string;
+} {
+  const trimmed = rawIp.trim();
+  if (!trimmed) {
+    return { valid: false, ip: '', error: '请输入目标电脑的局域网 IPv4 地址（如 192.168.50.25）。' };
+  }
+
+  let host = trimmed;
+  let parsedPort: number | undefined;
+  if (trimmed.includes(':')) {
+    const parts = trimmed.split(':');
+    if (parts.length !== 2) {
+      return { valid: false, ip: trimmed, error: 'IP 地址格式无效，请使用如 192.168.1.20 或 192.168.1.20:24800。' };
+    }
+    host = parts[0].trim();
+    const p = Number(parts[1]);
+    if (!Number.isInteger(p) || p < 1 || p > 65535) {
+      return { valid: false, ip: trimmed, error: '端口号需在 1 ~ 65535 之间。' };
+    }
+    parsedPort = p;
+  }
+
+  const segs = host.split('.');
+  if (segs.length !== 4 || segs.some((s) => !/^\d{1,3}$/.test(s))) {
+    return { valid: false, ip: host, error: '请输入合法的局域网 IPv4 地址（例如 192.168.1.20）。' };
+  }
+  const nums = segs.map(Number);
+  if (nums.some((n) => n < 0 || n > 255)) {
+    return { valid: false, ip: host, error: 'IPv4 地址每段数值需在 0 ~ 255 之间。' };
+  }
+
+  const isPrivate =
+    nums[0] === 10 ||
+    nums[0] === 127 ||
+    (nums[0] === 172 && nums[1] >= 16 && nums[1] <= 31) ||
+    (nums[0] === 192 && nums[1] === 168) ||
+    (nums[0] === 169 && nums[1] === 254);
+
+  if (!isPrivate) {
+    return {
+      valid: false,
+      ip: host,
+      error: 'SpanKVM 仅限局域网内安全直连，拒绝公网 IP 地址。',
+    };
+  }
+
+  return { valid: true, ip: host, port: parsedPort };
+}
+
+export function encodeArrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const slice = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...slice);
+  }
+  if (typeof btoa === 'function') {
+    return btoa(binary);
+  }
+  return Buffer.from(bytes).toString('base64');
+}
+
 

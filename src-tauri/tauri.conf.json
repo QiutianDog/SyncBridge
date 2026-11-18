@@ -13,11 +13,13 @@
     "windows": [
       {
         "label": "main",
-        "title": "SpanKVM — 跨系统键鼠共享控制台",
-        "width": 1360,
-        "height": 860,
+        "title": "SpanKVM",
+        "width": 1320,
+        "height": 840,
         "minWidth": 960,
         "minHeight": 640,
+        "center": true,
+        "dragDropEnabled": false,
         "resizable": true
       }
     ],

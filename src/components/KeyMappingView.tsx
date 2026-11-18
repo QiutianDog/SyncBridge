@@ -315,13 +315,13 @@ export const KeyMappingView: React.FC<KeyMappingViewProps> = ({
 
           {/* Interactive Key Mapping Validator */}
           <section
-            aria-label="按键映射沙盒验证器"
+            aria-label="按键映射输出校验"
             className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 space-y-3"
           >
             <div className="flex items-center gap-2">
               <Keyboard className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" />
               <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-                按键流向实时验证沙盒
+                目标系统按键输出即时核对
               </h3>
             </div>
 

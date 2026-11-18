@@ -195,24 +195,25 @@ jobs:
           fi
 
           cat > "$OUT_DIR/FIRST_RUN_GUIDE.txt" << 'EOF'
-          SpanKVM 本地实机验证快速说明
+          SpanKVM 跨系统键鼠共享软件 — 安装与使用指南
           ============================================================
-          1. 局域网要求：
-             请确保参与联调的电脑处于同一局域网子网内，并放行局域网 UDP 24800 (QUIC) 与 UDP 5353 (mDNS)。
+          1. 局域网端口说明：
+             请确保多台电脑处于同一局域网，并允许局域网内 UDP 24800 (QUIC 加密传输) 与 UDP 24801 (局域网设备自动发现)。
+             如跨 VLAN 或企业路由器屏蔽广播，可在「设备发现与配对 -> 手动输入 IP 配对」中输入对方 IP 直接连接。
           2. 各系统首次运行权限说明：
-             - macOS（无开发者证书签名的 CI 测试包）：
+             - macOS（无 Apple 付费证书签名的 CI 构建包）：
                拖入 /Applications 后若提示“已损坏/无法验证开发者”，请在终端执行一次：
                sudo xattr -rd com.apple.quarantine /Applications/SpanKVM.app
-               随后在「系统设置 -> 隐私与安全性 -> 辅助功能」中勾选 SpanKVM。
+               打开软件后，在「系统与托盘设置」点击授权辅助功能（系统设置 -> 隐私与安全性 -> 辅助功能 -> 勾选 SpanKVM）。
+               macOS 版支持在「系统与托盘设置」中开启“隐藏程序坞 (Dock) 图标”（默认不隐藏）。
              - Windows 10 / 11：
-               可安装 *-setup.exe / *.msi，或直接双击免安装版 SpanKVM-portable-x64.exe。
-               若弹出 SmartScreen 提示，点击「更多信息 -> 仍要运行」并允许专用局域网防火墙通信。
+               安装 *-setup.exe / *.msi，或直接运行免安装版 SpanKVM-portable-x64.exe，允许专用局域网防火墙通信。
              - Linux (Wayland / X11)：
-               Ubuntu/Debian 安装 *.deb，或为 *.AppImage 添加可执行权限 (chmod +x) 后运行。
-               GNOME 46+ / KDE Plasma 6 / Hyprland 会自动弹出 InputCapture Portal 授权；
-               若使用不支持 Portal 的合成器，可执行附带的 bash setup-linux-uinput.sh 开启免 root uinput 后备驱动。
-          3. 紧急防锁死热键：
-             任何时候按下 Ctrl + Alt + Shift + Esc 即可强制将键鼠焦点切回主屏幕。
+               安装 *.deb / *.rpm，或 chmod +x *.AppImage 后运行。
+               支持 Wayland InputCapture Portal (libei) 与 /dev/uinput 双栈（可执行 bash setup-linux-uinput.sh 配置免 root 权限）。
+          3. 系统托盘与紧急热键：
+             - 左键点击系统托盘图标：直接展示并聚焦 SpanKVM 主窗口；右键点击：弹出托盘快捷菜单。
+             - 任何时候按下 Ctrl + Alt + Shift + Esc（macOS 为 Ctrl + Option + Shift + Esc）立即将键鼠控制权切回本机。
           EOF
 
           (

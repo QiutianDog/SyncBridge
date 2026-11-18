@@ -9,22 +9,22 @@ import {
   ShieldCheck,
   Keyboard,
   Clipboard,
-  FileCode2,
-  BookOpen,
-  Download,
+  Settings2,
   Sun,
   Moon,
   MonitorSmartphone,
 } from 'lucide-react';
-import type {
-  ClipboardPolicy,
-  DeviceNode,
-  DiscoveredPeer,
-  EngineTuning,
-  KeyMappingRule,
-  LinuxWaylandStrategy,
-  TransferRecord,
-  VirtualCursorState,
+import {
+  DEFAULT_QUIC_PORT,
+  DISCOVERY_UDP_PORT,
+  type ClipboardPolicy,
+  type DeviceNode,
+  type DiscoveredPeer,
+  type EngineTuning,
+  type KeyMappingRule,
+  type LocalSystemStatus,
+  type TransferRecord,
+  type VirtualCursorState,
 } from './utils/kvmEngine';
 import {
   INITIAL_DISCOVERED_PEERS,
@@ -33,37 +33,30 @@ import {
   INITIAL_TRANSFERS,
 } from './data/seedData';
 import {
-  DaemonSnapshot,
+  DEFAULT_CLIPBOARD_POLICY,
+  DEFAULT_TUNING,
+  type DaemonSnapshot,
   invokeDaemonCommand,
   isTauriNativeRuntime,
 } from './services/tauriBridge';
-import { generateStandaloneSampleHtml } from './utils/exportSampleHtml';
 import { TopologyWorkspace } from './components/TopologyWorkspace';
 import { PairingSecurityView } from './components/PairingSecurityView';
 import { KeyMappingView } from './components/KeyMappingView';
 import { ClipboardTransferView } from './components/ClipboardTransferView';
-import { WorkspaceSourceExplorer } from './components/WorkspaceSourceExplorer';
-import { RustArchitectureView } from './components/RustArchitectureView';
+import { SystemSettingsView } from './components/SystemSettingsView';
 
-type ActiveTab =
-  | 'topology'
-  | 'pairing'
-  | 'keymap'
-  | 'clipboard'
-  | 'workspace'
-  | 'architecture';
+type ActiveTab = 'topology' | 'pairing' | 'keymap' | 'clipboard' | 'settings';
 
 const NAV_ITEMS: {
   id: ActiveTab;
   label: string;
   icon: React.ComponentType<{ className?: string }>;
 }[] = [
-  { id: 'topology', label: '屏幕拓扑与主屏', icon: LayoutGrid },
-  { id: 'pairing', label: '局域网配对与加密', icon: ShieldCheck },
+  { id: 'topology', label: '屏幕拓扑与控制', icon: LayoutGrid },
+  { id: 'pairing', label: '设备发现与配对', icon: ShieldCheck },
   { id: 'keymap', label: '跨系统按键映射', icon: Keyboard },
-  { id: 'clipboard', label: '剪贴板与文件拖拽', icon: Clipboard },
-  { id: 'workspace', label: 'Rust + Tauri 工程', icon: FileCode2 },
-  { id: 'architecture', label: '架构设计文档', icon: BookOpen },
+  { id: 'clipboard', label: '剪贴板与文件传输', icon: Clipboard },
+  { id: 'settings', label: '系统与托盘设置', icon: Settings2 },
 ];
 
 export default function App() {
@@ -84,30 +77,27 @@ export default function App() {
     transitionCount: 0,
   });
 
-  const [tuning, setTuning] = useState<EngineTuning>({
-    daemonActive: true,
-    hidPollingHz: 1000,
-    edgeDelayMs: 0,
-    releaseHotkey: 'Ctrl + Alt + Shift + Esc',
-    linuxWaylandStrategy: 'portal-and-uinput-fallback',
-  });
-
-  const [clipboardPolicy, setClipboardPolicy] = useState<ClipboardPolicy>({
-    syncPlainText: true,
-    syncImages: true,
-    enableDragDropFile: true,
-    maxFileSizeMb: 500,
-    saveDir: '~/Downloads/SpanKVM',
-  });
+  const [tuning, setTuning] = useState<EngineTuning>(DEFAULT_TUNING);
+  const [clipboardPolicy, setClipboardPolicy] = useState<ClipboardPolicy>(
+    DEFAULT_CLIPBOARD_POLICY
+  );
 
   const [localEphemeralPin, setLocalEphemeralPin] = useState<string>('482-915');
   const [activeDriverName, setActiveDriverName] = useState<string>(
-    'Wayland Portal (libei) + /dev/uinput 双栈就绪'
+    'macOS CoreGraphics CGEventTap + CGEventPost'
   );
+  const [systemStatus, setSystemStatus] = useState<LocalSystemStatus>({
+    localNodeId: INITIAL_NODES[0].id,
+    localOs: INITIAL_NODES[0].os,
+    localIp: INITIAL_NODES[0].ip,
+    quicPort: DEFAULT_QUIC_PORT,
+    discoveryPort: DISCOVERY_UDP_PORT,
+    fingerprint: INITIAL_NODES[0].fingerprint,
+    inputPermissionGranted: true,
+    connectedPeerCount: INITIAL_NODES.filter((n) => !n.isPrimary && n.online).length,
+  });
   const [keyRules, setKeyRules] = useState<KeyMappingRule[]>(INITIAL_KEY_RULES);
   const [transfers, setTransfers] = useState<TransferRecord[]>(INITIAL_TRANSFERS);
-
-  const [htmlCopiedNotice, setHtmlCopiedNotice] = useState<boolean>(false);
 
   const applySnapshot = useCallback((snap?: DaemonSnapshot) => {
     if (!snap) return;
@@ -123,15 +113,32 @@ export default function App() {
     setTransfers(snap.transfers);
     setLocalEphemeralPin(snap.localEphemeralPin);
     setActiveDriverName(snap.activeDriverName);
+    setSystemStatus(snap.systemStatus);
   }, []);
 
-  // Hydrate persistent state from Tauri v2 IPC / Express daemon bridge on startup
+  // Hydrate persistent state from Tauri v2 IPC / Express daemon bridge on startup,
+  // and poll periodically in native desktop mode so LAN discovery & tray actions stay synced
   useEffect(() => {
-    invokeDaemonCommand('get_daemon_snapshot').then((res) => {
-      if (res.ok && res.snapshot) {
+    let active = true;
+    const syncOnce = async () => {
+      const res = await invokeDaemonCommand('get_daemon_snapshot');
+      if (active && res.ok && res.snapshot) {
         applySnapshot(res.snapshot);
       }
-    });
+    };
+    syncOnce();
+
+    if (!isTauriNativeRuntime()) {
+      return () => {
+        active = false;
+      };
+    }
+
+    const timer = window.setInterval(syncOnce, 2500);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
   }, [applySnapshot]);
 
   useEffect(() => {
@@ -148,7 +155,7 @@ export default function App() {
     if (res.ok) applySnapshot(res.snapshot);
   }, [applySnapshot]);
 
-  // Global emergency focus-reclaim shortcut: Ctrl + Alt + Shift + Escape
+  // Global emergency focus-reclaim shortcut inside window: Ctrl + Alt + Shift + Escape
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.ctrlKey && e.altKey && e.shiftKey && e.key === 'Escape') {
@@ -189,14 +196,10 @@ export default function App() {
   };
 
   const handleUpdateTuning = async (patch: Partial<EngineTuning>) => {
+    setTuning((prev) => ({ ...prev, ...patch }));
     const res = await invokeDaemonCommand('update_engine_tuning', {
       tuning: patch,
     });
-    if (res.ok) applySnapshot(res.snapshot);
-  };
-
-  const handleStepCursor = async (dx: number, dy: number) => {
-    const res = await invokeDaemonCommand('step_virtual_cursor', { dx, dy });
     if (res.ok) applySnapshot(res.snapshot);
   };
 
@@ -205,24 +208,14 @@ export default function App() {
     if (res.ok) applySnapshot(res.snapshot);
   };
 
-  const handleLoadNinePreset = async () => {
-    const res = await invokeDaemonCommand('load_nine_preset');
-    if (res.ok && res.snapshot) {
-      applySnapshot(res.snapshot);
-      if (res.snapshot.nodes[0]) {
-        setSelectedNodeId(res.snapshot.nodes[0].id);
-      }
-    }
+  const handleRequestInputPermission = async () => {
+    const res = await invokeDaemonCommand('request_input_permission');
+    if (res.ok) applySnapshot(res.snapshot);
   };
 
-  const handleResetDefaultPreset = async () => {
-    const res = await invokeDaemonCommand('reset_default_preset');
-    if (res.ok && res.snapshot) {
-      applySnapshot(res.snapshot);
-      if (res.snapshot.nodes[0]) {
-        setSelectedNodeId(res.snapshot.nodes[0].id);
-      }
-    }
+  const handleScanLanPeers = async () => {
+    const res = await invokeDaemonCommand('scan_lan_peers');
+    if (res.ok) applySnapshot(res.snapshot);
   };
 
   const handlePairPeer = async (
@@ -237,6 +230,32 @@ export default function App() {
       error?: string;
     }>('pair_peer_spake2', {
       peerId: peer.id,
+      pinInput,
+      autoPair,
+    });
+    if (res.ok) {
+      applySnapshot(res.snapshot);
+      if (res.addedNode) {
+        setSelectedNodeId(res.addedNode.id);
+      }
+    }
+    return { ok: res.ok, error: res.error };
+  };
+
+  const handlePairByIp = async (
+    ip: string,
+    port: number,
+    pinInput: string,
+    autoPair: boolean
+  ) => {
+    const res = await invokeDaemonCommand<{
+      ok: boolean;
+      snapshot?: DaemonSnapshot;
+      addedNode?: DeviceNode;
+      error?: string;
+    }>('pair_by_ip_spake2', {
+      ip,
+      port,
       pinInput,
       autoPair,
     });
@@ -282,16 +301,35 @@ export default function App() {
   const handleUpdateClipboardPolicy = async (
     patch: Partial<ClipboardPolicy>
   ) => {
+    setClipboardPolicy((prev) => ({ ...prev, ...patch }));
     const res = await invokeDaemonCommand('update_clipboard_policy', {
       policy: patch,
     });
     if (res.ok) applySnapshot(res.snapshot);
   };
 
-  const handleAddTransfer = async (
-    record: Omit<TransferRecord, 'id' | 'timestamp'>
+  const handleBroadcastClipboard = async (text: string) => {
+    const res = await invokeDaemonCommand('broadcast_clipboard_text', { text });
+    if (res.ok) applySnapshot(res.snapshot);
+    return { ok: res.ok, error: res.error };
+  };
+
+  const handleSendFilePayload = async (
+    fileName: string,
+    targetNodeId: string,
+    base64Data: string
   ) => {
-    const res = await invokeDaemonCommand('push_transfer_record', { record });
+    const res = await invokeDaemonCommand('send_file_payload', {
+      fileName,
+      targetNodeId,
+      base64Data,
+    });
+    if (res.ok) applySnapshot(res.snapshot);
+    return { ok: res.ok, error: res.error };
+  };
+
+  const handleOpenReceiveDir = async () => {
+    const res = await invokeDaemonCommand('open_receive_dir');
     if (res.ok) applySnapshot(res.snapshot);
   };
 
@@ -300,35 +338,11 @@ export default function App() {
     if (res.ok) applySnapshot(res.snapshot);
   };
 
-  const handleExportSampleHtml = async () => {
-    const htmlContent = generateStandaloneSampleHtml(
-      nodes,
-      keyRules,
-      localEphemeralPin
-    );
-    if (isTauriNativeRuntime()) {
-      await navigator.clipboard.writeText(htmlContent);
-      setHtmlCopiedNotice(true);
-      setTimeout(() => setHtmlCopiedNotice(false), 2000);
-      return;
-    }
-    const blob = new Blob([htmlContent], { type: 'text/html;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = 'spankvm-ui-snapshot.html';
-    document.body.appendChild(anchor);
-    anchor.click();
-    document.body.removeChild(anchor);
-    URL.revokeObjectURL(url);
-  };
-
   const currentNavLabel =
-    NAV_ITEMS.find((item) => item.id === activeTab)?.label ?? '屏幕拓扑与主屏';
+    NAV_ITEMS.find((item) => item.id === activeTab)?.label ?? '屏幕拓扑与控制';
   const primaryNode = nodes.find((n) => n.isPrimary) ?? nodes[0];
   const activeFocusNode =
     nodes.find((n) => n.id === cursor?.activeNodeId) ?? primaryNode;
-  const isTauri = isTauriNativeRuntime();
 
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 flex flex-col md:flex-row">
@@ -375,28 +389,28 @@ export default function App() {
           </nav>
         </div>
 
-        {/* Runtime Status Summary in Sidebar Footer */}
+        {/* Local Host & Active Focus Summary in Sidebar Footer */}
         <div className="hidden md:block p-4 m-3 rounded-lg bg-slate-50 dark:bg-slate-950 border border-slate-200/80 dark:border-slate-800 space-y-2 text-xs">
-          <div className="text-slate-500 dark:text-slate-400">
-            {isTauri ? 'Tauri v2 原生守护进程' : 'Tauri v2 兼容守护桥接'}
+          <div className="font-mono text-slate-500 dark:text-slate-400 truncate tabular-nums">
+            本机：{systemStatus.localIp}:{systemStatus.quicPort}
           </div>
           <div className="font-semibold text-slate-900 dark:text-slate-100 truncate">
-            焦点：{activeFocusNode?.name}
+            当前焦点：{activeFocusNode?.name}
           </div>
           <div className="text-slate-500 dark:text-slate-400 pt-1 border-t border-slate-200/70 dark:border-slate-800 truncate tabular-nums">
             主屏幕：{primaryNode?.name}
           </div>
           <div className="text-slate-500 dark:text-slate-400 truncate tabular-nums">
-            已互联：{nodes.length} / 9 台 · Wayland 就绪
+            已配置节点：{nodes.length} / 9 台 · 在线 {systemStatus.connectedPeerCount + 1} 台
           </div>
         </div>
       </aside>
 
       {/* Right Main Workspace Viewport */}
       <div className="flex-1 min-w-0 flex flex-col">
-        <header className="bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 px-6 py-3.5 flex items-center justify-between gap-6">
+        <header className="bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 px-6 py-3.5 flex items-center justify-between gap-8">
           <div className="text-xs sm:text-sm text-slate-500 dark:text-slate-400 truncate">
-            <span>SpanKVM 跨系统键鼠控制台</span>
+            <span>SpanKVM 跨系统键鼠共享</span>
             <span className="mx-2 text-slate-300 dark:text-slate-700">/</span>
             <span className="font-medium text-slate-900 dark:text-slate-100">
               {currentNavLabel}
@@ -404,6 +418,20 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2.5 shrink-0">
+            <button
+              type="button"
+              onClick={() =>
+                handleUpdateTuning({ daemonActive: !tuning.daemonActive })
+              }
+              className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 ${
+                tuning.daemonActive
+                  ? 'border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300'
+                  : 'border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 text-amber-800 dark:text-amber-300'
+              }`}
+            >
+              {tuning.daemonActive ? '跨屏共享：运行中' : '跨屏共享：已暂停'}
+            </button>
+
             <button
               type="button"
               onClick={() => setDarkMode((v) => !v)}
@@ -416,21 +444,6 @@ export default function App() {
                 <Moon className="w-3.5 h-3.5" />
               )}
               <span>{darkMode ? '浅色外观' : '深色外观'}</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={handleExportSampleHtml}
-              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
-            >
-              <Download className="w-3.5 h-3.5" />
-              <span>
-                {htmlCopiedNotice
-                  ? '已复制拓扑快照 HTML'
-                  : isTauri
-                    ? '复制拓扑快照 HTML'
-                    : '导出拓扑快照 HTML'}
-              </span>
             </button>
           </div>
         </header>
@@ -445,15 +458,12 @@ export default function App() {
               onMoveNode={handleMoveNode}
               onUpdateNodeRefreshRate={handleUpdateRefreshRate}
               cursor={cursor}
-              onStepCursor={handleStepCursor}
               onJumpCursorToNode={handleJumpCursorToNode}
               onEmergencyReturnPrimary={handleEmergencyReturnPrimary}
               daemonActive={tuning.daemonActive}
               onToggleDaemonActive={() =>
                 handleUpdateTuning({ daemonActive: !tuning.daemonActive })
               }
-              onLoadNinePreset={handleLoadNinePreset}
-              onResetDefaultPreset={handleResetDefaultPreset}
               onNavigateToPairing={() => setActiveTab('pairing')}
               hidPollingHz={tuning.hidPollingHz}
               onChangeHidPollingHz={(hz) =>
@@ -463,7 +473,9 @@ export default function App() {
               onChangeEdgeDelayMs={(ms) =>
                 handleUpdateTuning({ edgeDelayMs: ms })
               }
-              keyRules={keyRules}
+              releaseHotkey={tuning.releaseHotkey}
+              systemStatus={systemStatus}
+              onRequestInputPermission={handleRequestInputPermission}
             />
           )}
 
@@ -472,11 +484,16 @@ export default function App() {
               nodes={nodes}
               discoveredPeers={discoveredPeers}
               localEphemeralPin={localEphemeralPin}
+              localIp={systemStatus.localIp}
+              quicPort={systemStatus.quicPort}
+              localNodeId={systemStatus.localNodeId}
               onRefreshLocalPin={async () => {
                 const res = await invokeDaemonCommand('rotate_ephemeral_pin');
                 if (res.ok) applySnapshot(res.snapshot);
               }}
+              onScanLanPeers={handleScanLanPeers}
               onPairPeer={handlePairPeer}
+              onPairByIp={handlePairByIp}
               onToggleAutoPair={handleToggleAutoPair}
               onRemoveNode={handleRemoveNode}
             />
@@ -499,22 +516,22 @@ export default function App() {
               policy={clipboardPolicy}
               onUpdatePolicy={handleUpdateClipboardPolicy}
               transfers={transfers}
-              onAddTransfer={handleAddTransfer}
+              onBroadcastClipboard={handleBroadcastClipboard}
+              onSendFilePayload={handleSendFilePayload}
+              onOpenReceiveDir={handleOpenReceiveDir}
               onClearTransfers={handleClearTransfers}
             />
           )}
 
-          {activeTab === 'workspace' && (
-            <WorkspaceSourceExplorer
+          {activeTab === 'settings' && (
+            <SystemSettingsView
               tuning={tuning}
+              systemStatus={systemStatus}
               activeDriverName={activeDriverName}
-              onChangeWaylandStrategy={(strategy: LinuxWaylandStrategy) =>
-                handleUpdateTuning({ linuxWaylandStrategy: strategy })
-              }
+              onUpdateTuning={handleUpdateTuning}
+              onRequestInputPermission={handleRequestInputPermission}
             />
           )}
-
-          {activeTab === 'architecture' && <RustArchitectureView />}
         </main>
       </div>
     </div>
