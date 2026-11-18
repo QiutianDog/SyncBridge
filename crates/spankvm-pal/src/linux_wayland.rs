@@ -79,7 +79,10 @@ impl LinuxDualStackDriver {
             .await
             .map_err(|e| PalError::DriverInitFailed(format!("DBus InputCapture portal: {e}")))?;
         let (_session, _caps) = proxy
-            .create_session(None, Capabilities::Keyboard | Capabilities::Pointer)
+            .create_session(
+                None::<&ashpd::WindowIdentifier>,
+                Capabilities::Keyboard | Capabilities::Pointer,
+            )
             .await
             .map_err(|e| PalError::PermissionDenied(format!("Wayland InputCapture 授权未通过: {e}")))?;
         Ok(())

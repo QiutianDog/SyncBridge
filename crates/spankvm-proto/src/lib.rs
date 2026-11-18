@@ -191,3 +191,25 @@ pub enum ReliableControlFrame {
         bytes: Vec<u8>,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fast_pointer_datagram_roundtrip_14_bytes() {
+        let frame = FastPointerDatagram {
+            frame_type: 0x01,
+            target_node: 3,
+            seq: 102_400,
+            timestamp_us: 998_123,
+            dx_subpx: -240,
+            dy_subpx: 128,
+        };
+        let wire = frame.encode();
+        assert_eq!(wire.len(), FastPointerDatagram::WIRE_LEN);
+        let decoded = FastPointerDatagram::decode(&wire).expect("valid 14-byte frame");
+        assert_eq!(decoded, frame);
+    }
+}
+

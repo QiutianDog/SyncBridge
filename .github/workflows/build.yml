@@ -1,0 +1,276 @@
+name: Build SpanKVM Desktop Artifacts
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - dev
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      debug_build:
+        description: '构建带调试符号的 Debug 包（默认关闭，输出 Release 优化包）'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: spankvm-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+
+jobs:
+  verify-frontend-and-protocol:
+    name: Frontend & Protocol Unit Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install frontend dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund || npm install --legacy-peer-deps --no-audit --no-fund
+          fi
+
+      - name: Run protocol & topology unit tests
+        run: npx tsx --test src/utils/kvmEngine.test.ts
+
+      - name: TypeScript check & Vite frontend build
+        run: |
+          npm run lint
+          npm run build
+
+  build-desktop:
+    name: Build ${{ matrix.platform_label }}
+    needs: verify-frontend-and-protocol
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            artifact_name: SpanKVM-Windows-x64
+            platform_label: Windows 10/11 (x64)
+          - os: macos-latest
+            rust_target: aarch64-apple-darwin
+            artifact_name: SpanKVM-macOS-Apple-Silicon-arm64
+            platform_label: macOS Apple Silicon (M1-M4)
+          - os: macos-latest
+            rust_target: x86_64-apple-darwin
+            artifact_name: SpanKVM-macOS-Intel-x64
+            platform_label: macOS Intel (x86_64)
+          - os: ubuntu-22.04
+            rust_target: x86_64-unknown-linux-gnu
+            artifact_name: SpanKVM-Linux-Wayland-X11-x64
+            platform_label: Linux x64 (Wayland + X11)
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies (WebKitGTK 4.1 + Tray + FUSE)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libfuse2 \
+            xdg-utils
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Rust stable toolchain (${{ matrix.rust_target }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache Cargo workspace build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '.'
+          key: ${{ matrix.rust_target }}
+
+      - name: Install frontend dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund || npm install --legacy-peer-deps --no-audit --no-fund
+          fi
+
+      - name: Verify or generate Tauri v2 bundle icons
+        run: |
+          if [ ! -f src-tauri/icons/icon.ico ] || [ ! -f src-tauri/icons/icon.icns ]; then
+            npx --yes @tauri-apps/cli@2 icon src-tauri/app-icon.svg
+          fi
+
+      - name: Run Rust core crate unit tests
+        run: cargo test -p spankvm-proto -p spankvm-core -p spankvm-net
+
+      - name: Build Tauri v2 cross-platform bundles
+        env:
+          CI: true
+          APPIMAGE_EXTRACT_AND_RUN: 1
+        run: |
+          EXTRA_FLAGS=""
+          if [ "${{ inputs.debug_build }}" = "true" ]; then
+            EXTRA_FLAGS="--debug"
+          fi
+
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            npx --yes @tauri-apps/cli@2 build --target "${{ matrix.rust_target }}" $EXTRA_FLAGS \
+              || npx --yes @tauri-apps/cli@2 build --target "${{ matrix.rust_target }}" --bundles deb,rpm $EXTRA_FLAGS
+          else
+            npx --yes @tauri-apps/cli@2 build --target "${{ matrix.rust_target }}" $EXTRA_FLAGS
+          fi
+
+      - name: Stage installers, portable binaries & local verification guide
+        run: |
+          PROFILE_DIR="release"
+          if [ "${{ inputs.debug_build }}" = "true" ]; then
+            PROFILE_DIR="debug"
+          fi
+
+          OUT_DIR="release-artifacts/${{ matrix.artifact_name }}"
+          mkdir -p "$OUT_DIR"
+
+          for ROOT_CANDIDATE in "target/${{ matrix.rust_target }}/$PROFILE_DIR" "src-tauri/target/${{ matrix.rust_target }}/$PROFILE_DIR"; do
+            if [ -d "$ROOT_CANDIDATE/bundle" ]; then
+              find "$ROOT_CANDIDATE/bundle" -maxdepth 3 -type f \
+                \( -name "*.dmg" -o -name "*.msi" -o -name "*-setup.exe" -o -name "*.deb" -o -name "*.rpm" -o -name "*.AppImage" \) \
+                -exec cp -v {} "$OUT_DIR/" \;
+
+              if [ "${{ runner.os }}" = "macOS" ] && [ -d "$ROOT_CANDIDATE/bundle/macos/SpanKVM.app" ]; then
+                ditto -c -k --sequesterRsrc --keepParent \
+                  "$ROOT_CANDIDATE/bundle/macos/SpanKVM.app" \
+                  "$OUT_DIR/SpanKVM-${{ matrix.rust_target }}.app.zip"
+              fi
+            fi
+
+            if [ "${{ runner.os }}" = "Windows" ] && [ -f "$ROOT_CANDIDATE/spankvm-tauri.exe" ]; then
+              cp -v "$ROOT_CANDIDATE/spankvm-tauri.exe" "$OUT_DIR/SpanKVM-portable-x64.exe"
+            fi
+
+            if [ "${{ runner.os }}" = "Linux" ] && [ -f "$ROOT_CANDIDATE/spankvm-tauri" ]; then
+              cp -v "$ROOT_CANDIDATE/spankvm-tauri" "$OUT_DIR/spankvm-linux-x64"
+              chmod +x "$OUT_DIR/spankvm-linux-x64"
+            fi
+          done
+
+          if [ "${{ runner.os }}" = "Linux" ] && [ -f scripts/setup-linux-uinput.sh ]; then
+            cp -v scripts/setup-linux-uinput.sh "$OUT_DIR/setup-linux-uinput.sh"
+            chmod +x "$OUT_DIR/setup-linux-uinput.sh"
+          fi
+
+          cat > "$OUT_DIR/FIRST_RUN_GUIDE.txt" << 'EOF'
+          SpanKVM 本地实机验证快速说明
+          ============================================================
+          1. 局域网要求：
+             请确保参与联调的电脑处于同一局域网子网内，并放行局域网 UDP 24800 (QUIC) 与 UDP 5353 (mDNS)。
+          2. 各系统首次运行权限说明：
+             - macOS（无开发者证书签名的 CI 测试包）：
+               拖入 /Applications 后若提示“已损坏/无法验证开发者”，请在终端执行一次：
+               sudo xattr -rd com.apple.quarantine /Applications/SpanKVM.app
+               随后在「系统设置 -> 隐私与安全性 -> 辅助功能」中勾选 SpanKVM。
+             - Windows 10 / 11：
+               可安装 *-setup.exe / *.msi，或直接双击免安装版 SpanKVM-portable-x64.exe。
+               若弹出 SmartScreen 提示，点击「更多信息 -> 仍要运行」并允许专用局域网防火墙通信。
+             - Linux (Wayland / X11)：
+               Ubuntu/Debian 安装 *.deb，或为 *.AppImage 添加可执行权限 (chmod +x) 后运行。
+               GNOME 46+ / KDE Plasma 6 / Hyprland 会自动弹出 InputCapture Portal 授权；
+               若使用不支持 Portal 的合成器，可执行附带的 bash setup-linux-uinput.sh 开启免 root uinput 后备驱动。
+          3. 紧急防锁死热键：
+             任何时候按下 Ctrl + Alt + Shift + Esc 即可强制将键鼠焦点切回主屏幕。
+          EOF
+
+          (
+            cd "$OUT_DIR"
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum * > SHA256SUMS.txt
+            else
+              shasum -a 256 * > SHA256SUMS.txt
+            fi
+          )
+
+          {
+            echo "### ${{ matrix.platform_label }} (\`${{ matrix.artifact_name }}\`)"
+            echo ""
+            echo "| 构建产物文件名 | SHA-256 校验值 |"
+            echo "| :--- | :--- |"
+            while read -r hash fname; do
+              echo "| \`$fname\` | \`$hash\` |"
+            done < "$OUT_DIR/SHA256SUMS.txt"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Build Artifact (${{ matrix.artifact_name }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: release-artifacts/${{ matrix.artifact_name }}/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-github-release:
+    name: Publish GitHub Release (on v* tag)
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-desktop
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-bundle
+          merge-multiple: false
+
+      - name: Create GitHub Release with installers
+        uses: softprops/action-gh-release@v2
+        with:
+          name: SpanKVM ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            release-bundle/**/*.dmg
+            release-bundle/**/*.app.zip
+            release-bundle/**/*.msi
+            release-bundle/**/*-setup.exe
+            release-bundle/**/SpanKVM-portable-x64.exe
+            release-bundle/**/*.deb
+            release-bundle/**/*.rpm
+            release-bundle/**/*.AppImage
+            release-bundle/**/setup-linux-uinput.sh

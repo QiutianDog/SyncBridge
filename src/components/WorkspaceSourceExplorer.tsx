@@ -28,7 +28,7 @@ export const WorkspaceSourceExplorer: React.FC<WorkspaceSourceExplorerProps> = (
 }) => {
   const [files, setFiles] = useState<WorkspaceFileEntry[]>([]);
   const [selectedPath, setSelectedPath] = useState<string>(
-    'crates/spankvm-pal/src/linux_wayland.rs'
+    '.github/workflows/build.yml'
   );
   const [fileContent, setFileContent] = useState<string>('');
   const [fileSummary, setFileSummary] = useState<string>('');
@@ -144,13 +144,13 @@ export const WorkspaceSourceExplorer: React.FC<WorkspaceSourceExplorerProps> = (
         <div className="p-5 space-y-1">
           <div className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
             <Terminal className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400 shrink-0" />
-            <span>本地桌面启动与构建命令</span>
+            <span>GitHub Actions 云端四端构建</span>
           </div>
-          <div className="font-mono text-xs text-slate-900 dark:text-slate-100 bg-slate-50 dark:bg-slate-950 border border-slate-200/80 dark:border-slate-800 rounded px-2.5 py-1.5">
-            npx @tauri-apps/cli@2 dev
+          <div className="font-mono text-xs text-slate-900 dark:text-slate-100 bg-slate-50 dark:bg-slate-950 border border-slate-200/80 dark:border-slate-800 rounded px-2.5 py-1.5 truncate">
+            .github/workflows/build.yml
           </div>
-          <div className="text-xs text-slate-500 dark:text-slate-400">
-            Linux 免 root 权限脚本：scripts/setup-linux-uinput.sh
+          <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
+            推送代码自动产出 Win / Mac / Linux 安装包
           </div>
         </div>
       </section>

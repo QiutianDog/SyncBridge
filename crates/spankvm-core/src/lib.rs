@@ -273,3 +273,54 @@ pub fn resolve_mapped_key<'a>(
 
     physical_key
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spankvm_proto::Resolution;
+
+    fn sample_node(id: &str, col: i32, row: i32, primary: bool) -> DeviceNode {
+        DeviceNode {
+            id: id.to_string(),
+            name: id.to_string(),
+            hostname: format!("{id}.local"),
+            os: OsKind::LinuxWayland,
+            ip: "192.168.1.10".to_string(),
+            resolution: Resolution { width: 1920, height: 1080 },
+            refresh_rate_hz: 144,
+            is_primary: primary,
+            grid_pos: GridPos { col, row },
+            auto_pair: true,
+            online: true,
+            latency_ms: 0.4,
+            fingerprint: "ED25519:AA:BB:CC:DD".to_string(),
+            paired_at: "今日".to_string(),
+        }
+    }
+
+    #[test]
+    fn focus_follows_mouse_and_releases_held_keys_on_screen_exit() {
+        let nodes = vec![
+            sample_node("primary", 2, 2, true),
+            sample_node("right", 3, 2, false),
+        ];
+        let mut router = FocusRouter::new("primary");
+        router.record_key_state(29, true); // Left Ctrl held
+
+        let outcome = router.step_pointer_delta(&nodes, 1200.0, 0.0);
+        assert_eq!(outcome.active_node_id, "right");
+        assert_eq!(outcome.synthetic_keyups_for_previous, vec![29]);
+        assert!(router.held_scancodes.is_empty());
+    }
+
+    #[test]
+    fn rejects_disconnected_screen_island() {
+        let nodes = vec![
+            sample_node("primary", 2, 2, true),
+            sample_node("right", 3, 2, false),
+        ];
+        let err = move_node_to_cell(&nodes, "right", 0, 0).unwrap_err();
+        assert_eq!(err, TopologyError::DisconnectedIsland);
+    }
+}
+

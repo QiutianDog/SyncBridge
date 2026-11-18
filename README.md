@@ -15,6 +15,23 @@
 - `src-tauri/`：Tauri v2 原生桌面宿主与后台托盘守护入口
 - `src/`：React + TypeScript + Tailwind CSS 控制台前端（同时支持 Tauri v2 原生 IPC 与 Web 预览守护后端）
 
+## GitHub Actions 云端自动构建与直接下载验证（免装本地编译环境）
+
+仓库已配置 `.github/workflows/build.yml` 跨平台流水线：
+1. **自动触发与手动运行**：
+   - 向 `main` / `master` / `dev` 分支推送代码时自动触发；也可在 GitHub 仓库顶栏进入 **Actions -> Build SpanKVM Desktop Artifacts -> Run workflow** 手动一键触发。
+   - 若推送版本标签（例如 `git tag v0.1.0 && git push --tags`），流水线还会自动创建 **GitHub Release** 并挂载全部安装包。
+2. **直接下载四端构建产物（Artifacts）**：
+   构建完成后，打开当次 Actions 运行详情页底部的 **Artifacts** 区域即可直接下载对应系统压缩包：
+   - `SpanKVM-Windows-x64`：含 `*-setup.exe`、`.msi` 安装包与免安装的 `SpanKVM-portable-x64.exe`
+   - `SpanKVM-macOS-Apple-Silicon-arm64`：Apple M1/M2/M3/M4 芯片 `.dmg` 与 `.app.zip`
+   - `SpanKVM-macOS-Intel-x64`：Intel 芯片 Mac `.dmg` 与 `.app.zip`
+   - `SpanKVM-Linux-Wayland-X11-x64`：含 `.deb`、`.AppImage`、`.rpm`、独立二进制及 `setup-linux-uinput.sh`
+3. **首次本地实机运行提示**：
+   - **macOS（未配置 Apple 付费开发者证书签名时）**：拖入 `/Applications` 后在终端执行一次 `sudo xattr -rd com.apple.quarantine /Applications/SpanKVM.app`，并在「系统设置 -> 隐私与安全性 -> 辅助功能」勾选 `SpanKVM`。
+   - **Windows 10/11**：若出现 SmartScreen 提示，点击「更多信息 -> 仍要运行」，并在防火墙弹窗勾选允许「专用局域网」通信（UDP `24800` / `5353`）。
+   - **Linux Wayland / X11**：GNOME 46+ / KDE Plasma 6 / Hyprland 首次启动会弹出 InputCapture Portal 授权；若合成器不支持 Portal，执行随包附带的 `bash setup-linux-uinput.sh` 即可开启免 root `uinput` 驱动。
+
 ## 本地桌面构建指南
 
 ### 1. 安装前置环境
@@ -22,7 +39,7 @@
 - **Linux (Ubuntu / Debian)**：
   ```bash
   sudo apt update
-  sudo apt install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev libudev-dev
+  sudo apt install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev libudev-dev patchelf libfuse2
   # 可选：为无 InputCapture Portal 的 Wayland 合成器配置免 root uinput 权限
   bash scripts/setup-linux-uinput.sh
   ```
@@ -35,3 +52,4 @@ npx @tauri-apps/cli@2 dev
 # 构建跨平台安装包 (.dmg / .msi / .deb / .AppImage)
 npx @tauri-apps/cli@2 build
 ```
+

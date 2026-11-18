@@ -250,3 +250,42 @@ test('14-byte FastPointerDatagram codec round-trips accurately and emergency ret
   assert.equal(reclaimed.transitionCount, 5);
 });
 
+test('GitHub Actions workflow and Tauri v2 bundle icon assets are complete and consistent', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const rootDir = path.resolve(import.meta.dirname, '../..');
+
+  const workflowPath = path.join(rootDir, '.github/workflows/build.yml');
+  assert.equal(fs.existsSync(workflowPath), true, '.github/workflows/build.yml must exist');
+  const workflowYaml = fs.readFileSync(workflowPath, 'utf-8');
+
+  for (const requiredTarget of [
+    'x86_64-pc-windows-msvc',
+    'aarch64-apple-darwin',
+    'x86_64-apple-darwin',
+    'x86_64-unknown-linux-gnu',
+  ]) {
+    assert.equal(
+      workflowYaml.includes(requiredTarget),
+      true,
+      `workflow must build target ${requiredTarget}`
+    );
+  }
+  assert.equal(workflowYaml.includes('actions/upload-artifact@v4'), true);
+  assert.equal(workflowYaml.includes('workflow_dispatch:'), true);
+
+  const tauriConfPath = path.join(rootDir, 'src-tauri/tauri.conf.json');
+  const tauriConf = JSON.parse(fs.readFileSync(tauriConfPath, 'utf-8')) as {
+    bundle?: { icon?: string[] };
+  };
+  const icons = tauriConf.bundle?.icon ?? [];
+  assert.equal(icons.length >= 5, true, 'tauri.conf.json must declare bundle icons');
+
+  for (const relIcon of icons) {
+    const absIcon = path.join(rootDir, 'src-tauri', relIcon);
+    assert.equal(fs.existsSync(absIcon), true, `Missing Tauri bundle icon: ${relIcon}`);
+    assert.equal(fs.statSync(absIcon).size > 0, true, `Empty Tauri bundle icon: ${relIcon}`);
+  }
+});
+
+

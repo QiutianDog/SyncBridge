@@ -117,6 +117,7 @@ function computePayloadDigestHex(content: string): string {
 }
 
 const WORKSPACE_FILES: { path: string; category: string; summary: string }[] = [
+  { path: '.github/workflows/build.yml', category: 'GitHub Actions CI/CD', summary: 'Windows / macOS (ARM64 + Intel) / Linux 四端矩阵自动构建与 Artifacts 产物直出' },
   { path: 'Cargo.toml', category: 'Rust Workspace', summary: 'Cargo Workspace 根清单与统一依赖锁' },
   { path: 'crates/spankvm-proto/src/lib.rs', category: 'spankvm-proto', summary: '14B 高速指针数据报编解码与跨端共享协议结构' },
   { path: 'crates/spankvm-core/src/lib.rs', category: 'spankvm-core', summary: '最多 9 屏正交连通求解、跨屏焦点跟随、防粘连看门狗与键位映射' },
@@ -482,6 +483,7 @@ async function startServer() {
       'attachment; filename="spankvm-rust-tauri-v2-workspace.tar.gz"'
     );
     const tarTargets = [
+      '.github',
       'Cargo.toml',
       'crates',
       'src-tauri',

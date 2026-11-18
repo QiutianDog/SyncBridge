@@ -137,3 +137,30 @@ impl QuicPeerSession {
 pub fn compute_chunk_blake3_hex(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enforces_lan_private_ip_perimeter() {
+        assert!(is_lan_private_address("192.168.50.12".parse().unwrap()));
+        assert!(is_lan_private_address("10.0.1.8".parse().unwrap()));
+        assert!(!is_lan_private_address("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn spake2_six_digit_pin_derives_matching_shared_secret() {
+        let mut guard = EphemeralPairingGuard::new("482-915".to_string());
+        let (resp_state, resp_msg) = guard.start_spake2_responder().unwrap();
+        let (init_state, init_msg) = Spake2::<Ed25519Group>::start_a(
+            &Password::new(b"482915"),
+            &Identity::new(b"spankvm-initiator"),
+            &Identity::new(b"spankvm-responder"),
+        );
+        let key_a = init_state.finish(&resp_msg).unwrap();
+        let key_b = resp_state.finish(&init_msg).unwrap();
+        assert_eq!(key_a, key_b);
+    }
+}
+
