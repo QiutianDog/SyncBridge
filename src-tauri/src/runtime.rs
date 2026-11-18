@@ -14,13 +14,16 @@ use spankvm_net::{
     LocalEd25519Identity, QuicPeerSession,
 };
 use spankvm_pal::{
-    clipboard::{read_os_clipboard_text, write_os_clipboard_image, write_os_clipboard_text},
+    clipboard::{
+        os_clipboard_sequence_token, read_os_clipboard_snapshot, write_os_clipboard_png_or_rgba,
+        write_os_clipboard_text, ClipboardSnapshot,
+    },
     spawn_platform_capture_thread, CapturedInputEvent,
 };
 use spankvm_proto::{
-    decode_base64, DeviceNode, FastPointerDatagram, GridPos, LanDiscoveryBeacon,
-    ReliableControlFrame, WireHandshakeRequest, WireHandshakeResponse, DEFAULT_QUIC_PORT,
-    DISCOVERY_UDP_PORT, MAX_DEVICES,
+    decode_base64, encode_base64, ClipboardImageWire, DeviceNode, FastPointerDatagram, GridPos,
+    LanDiscoveryBeacon, ReliableControlFrame, WireHandshakeRequest, WireHandshakeResponse,
+    DEFAULT_QUIC_PORT, DISCOVERY_UDP_PORT, MAX_DEVICES,
 };
 use tauri::AppHandle;
 use tokio::net::UdpSocket as TokioUdpSocket;
@@ -218,24 +221,27 @@ pub fn start_background_services(hub: Arc<DaemonHub>, app_handle: AppHandle) {
             });
         }
 
-        // 3. OS Clipboard Change Watcher Task
+        // 3. OS Clipboard Change Watcher Task (Plain Text + Lossless PNG Screenshots / Images)
         let hub_cb = Arc::clone(&hub);
         let app_cb = app_handle.clone();
         tauri::async_runtime::spawn(async move {
+            let mut linux_poll_parity = false;
             loop {
-                tokio::time::sleep(Duration::from_millis(750)).await;
-                let (enabled, last_hash, local_name) = {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let (daemon_active, allow_text, allow_img, last_hash, last_seq, local_name) = {
                     let Ok(guard) = hub_cb.state.read() else {
                         continue;
                     };
                     (
-                        guard.data.tuning.daemon_active
-                            && guard.data.clipboard_policy.sync_plain_text,
+                        guard.data.tuning.daemon_active,
+                        guard.data.clipboard_policy.sync_plain_text,
+                        guard.data.clipboard_policy.sync_images,
                         guard.last_synced_clipboard_hash.clone(),
+                        guard.last_os_clipboard_seq,
                         guard.data.tuning.local_device_name.clone(),
                     )
                 };
-                if !enabled {
+                if !daemon_active || (!allow_text && !allow_img) {
                     continue;
                 }
                 let sessions: Vec<QuicPeerSession> = hub_cb
@@ -247,67 +253,168 @@ pub fn start_background_services(hub: Arc<DaemonHub>, app_handle: AppHandle) {
                     continue;
                 }
 
-                let text_opt = tokio::task::spawn_blocking(read_os_clipboard_text)
-                    .await
-                    .ok()
-                    .and_then(|r| r.ok())
-                    .flatten();
-
-                let Some(text) = text_opt else {
-                    continue;
-                };
-                if text.len() > 2 * 1024 * 1024 {
-                    continue;
-                }
-                let hash = compute_chunk_blake3_hex(text.as_bytes());
-                if hash == last_hash {
-                    continue;
-                }
-
-                {
-                    let Ok(mut guard) = hub_cb.state.write() else {
-                        continue;
-                    };
-                    if guard.last_synced_clipboard_hash == hash {
+                // Zero-copy sequence number check on macOS (NSPasteboard.changeCount) & Windows (GetClipboardSequenceNumber)
+                let cur_seq = os_clipboard_sequence_token();
+                if let Some(seq) = cur_seq {
+                    if last_seq == Some(seq) {
                         continue;
                     }
-                    guard.last_synced_clipboard_hash = hash.clone();
-
-                    let title = if text.chars().count() > 48 {
-                        let p: String = text.chars().take(48).collect();
-                        format!("{p}...")
-                    } else {
-                        text.clone()
-                    };
-                    guard.data.transfers.insert(
-                        0,
-                        TransferRecordDto {
-                            id: format!("tr-{}", now_epoch_millis()),
-                            record_type: "clipboard-text".into(),
-                            title,
-                            size_label: format_bytes_human(text.len()),
-                            from_node_name: local_name,
-                            to_node_name: format!("自动同步 ({} 台在线)", sessions.len()),
-                            timestamp: now_hms_string(),
-                            encrypted: true,
-                            status: "completed".into(),
-                            digest_hex: Some(hash[0..16].to_string()),
-                        },
-                    );
+                } else {
+                    linux_poll_parity = !linux_poll_parity;
+                    if !linux_poll_parity {
+                        continue;
+                    }
                 }
 
-                for sess in sessions {
-                    let frame = ReliableControlFrame::ClipboardSync {
-                        mime: "text/plain;charset=utf-8".into(),
-                        blake3_hex: hash.clone(),
-                        text: Some(text.clone()),
-                        image: None,
-                    };
-                    tauri::async_runtime::spawn(async move {
-                        let _ = sess.send_reliable_frame(&frame, false).await;
-                    });
+                let snap_res = tokio::task::spawn_blocking(move || {
+                    read_os_clipboard_snapshot(allow_text, allow_img)
+                })
+                .await;
+
+                // Only commit `last_os_clipboard_seq` if reading succeeded (so transient OpenClipboard locks retry next tick)
+                let Ok(Ok(snapshot)) = snap_res else {
+                    continue;
+                };
+
+                match snapshot {
+                    ClipboardSnapshot::Empty => {
+                        if let Ok(mut guard) = hub_cb.state.write() {
+                            guard.last_os_clipboard_seq = cur_seq;
+                        }
+                    }
+
+                    ClipboardSnapshot::Image {
+                        width,
+                        height,
+                        png_bytes,
+                        blake3_hex,
+                    } => {
+                        if png_bytes.is_empty() || png_bytes.len() > 45 * 1024 * 1024 {
+                            if let Ok(mut guard) = hub_cb.state.write() {
+                                guard.last_os_clipboard_seq = cur_seq;
+                            }
+                            continue;
+                        }
+                        if blake3_hex == last_hash {
+                            if let Ok(mut guard) = hub_cb.state.write() {
+                                guard.last_os_clipboard_seq = cur_seq;
+                            }
+                            continue;
+                        }
+
+                        {
+                            let Ok(mut guard) = hub_cb.state.write() else {
+                                continue;
+                            };
+                            guard.last_os_clipboard_seq = cur_seq;
+                            if guard.last_synced_clipboard_hash == blake3_hex {
+                                continue;
+                            }
+                            guard.last_synced_clipboard_hash = blake3_hex.clone();
+                            guard.data.transfers.insert(
+                                0,
+                                TransferRecordDto {
+                                    id: format!("tr-{}", now_epoch_millis()),
+                                    record_type: "clipboard-image".into(),
+                                    title: format!("剪贴板截图 ({width}×{height})"),
+                                    size_label: format_bytes_human(png_bytes.len()),
+                                    from_node_name: local_name,
+                                    to_node_name: format!("自动同步 ({} 台在线)", sessions.len()),
+                                    timestamp: now_hms_string(),
+                                    encrypted: true,
+                                    status: "completed".into(),
+                                    digest_hex: Some(
+                                        blake3_hex[0..16.min(blake3_hex.len())].to_string(),
+                                    ),
+                                },
+                            );
+                        }
+
+                        let png_b64 = encode_base64(&png_bytes);
+                        for sess in sessions {
+                            let frame = ReliableControlFrame::ClipboardSync {
+                                mime: "image/png".into(),
+                                blake3_hex: blake3_hex.clone(),
+                                text: None,
+                                image: Some(ClipboardImageWire {
+                                    width,
+                                    height,
+                                    png_b64: png_b64.clone(),
+                                    rgba_b64: String::new(),
+                                }),
+                            };
+                            tauri::async_runtime::spawn(async move {
+                                let _ = sess.send_reliable_frame(&frame, false).await;
+                            });
+                        }
+                        hub_cb.persist();
+                        hub_cb.notify_frontend(&app_cb);
+                    }
+
+                    ClipboardSnapshot::Text { text, blake3_hex } => {
+                        if text.len() > 4 * 1024 * 1024 {
+                            if let Ok(mut guard) = hub_cb.state.write() {
+                                guard.last_os_clipboard_seq = cur_seq;
+                            }
+                            continue;
+                        }
+                        if blake3_hex == last_hash {
+                            if let Ok(mut guard) = hub_cb.state.write() {
+                                guard.last_os_clipboard_seq = cur_seq;
+                            }
+                            continue;
+                        }
+
+                        {
+                            let Ok(mut guard) = hub_cb.state.write() else {
+                                continue;
+                            };
+                            guard.last_os_clipboard_seq = cur_seq;
+                            if guard.last_synced_clipboard_hash == blake3_hex {
+                                continue;
+                            }
+                            guard.last_synced_clipboard_hash = blake3_hex.clone();
+
+                            let title = if text.chars().count() > 48 {
+                                let p: String = text.chars().take(48).collect();
+                                format!("{p}...")
+                            } else {
+                                text.clone()
+                            };
+                            guard.data.transfers.insert(
+                                0,
+                                TransferRecordDto {
+                                    id: format!("tr-{}", now_epoch_millis()),
+                                    record_type: "clipboard-text".into(),
+                                    title,
+                                    size_label: format_bytes_human(text.len()),
+                                    from_node_name: local_name,
+                                    to_node_name: format!("自动同步 ({} 台在线)", sessions.len()),
+                                    timestamp: now_hms_string(),
+                                    encrypted: true,
+                                    status: "completed".into(),
+                                    digest_hex: Some(
+                                        blake3_hex[0..16.min(blake3_hex.len())].to_string(),
+                                    ),
+                                },
+                            );
+                        }
+
+                        for sess in sessions {
+                            let frame = ReliableControlFrame::ClipboardSync {
+                                mime: "text/plain;charset=utf-8".into(),
+                                blake3_hex: blake3_hex.clone(),
+                                text: Some(text.clone()),
+                                image: None,
+                            };
+                            tauri::async_runtime::spawn(async move {
+                                let _ = sess.send_reliable_frame(&frame, false).await;
+                            });
+                        }
+                        hub_cb.persist();
+                        hub_cb.notify_frontend(&app_cb);
+                    }
                 }
-                hub_cb.notify_frontend(&app_cb);
             }
         });
 
@@ -353,55 +460,93 @@ async fn handle_captured_local_input(
             norm_x,
             norm_y,
         } => {
-            let target_session_and_id = {
+            enum HandoffDecision {
+                Proceed(QuicPeerSession, String),
+                AlreadyRemote,
+                AbortReleaseLocal,
+            }
+
+            let decision = {
                 let Ok(mut guard) = hub.state.write() else {
+                    hub.capture_ctrl.set_suppressing(false);
                     return;
                 };
                 if !guard.data.tuning.daemon_active {
-                    return;
+                    HandoffDecision::AbortReleaseLocal
+                } else {
+                    let local_id = guard.data.local_node_id.clone();
+                    if guard.cursor.active_node_id != local_id {
+                        let still_live = hub
+                            .sessions
+                            .read()
+                            .map(|s| s.contains_key(&guard.cursor.active_node_id))
+                            .unwrap_or(false);
+                        if still_live {
+                            HandoffDecision::AlreadyRemote
+                        } else {
+                            guard.cursor.active_node_id = local_id.clone();
+                            guard.router.active_node_id = local_id;
+                            HandoffDecision::AbortReleaseLocal
+                        }
+                    } else {
+                        let neighbors = compute_neighbors(&guard.data.nodes, &local_id);
+                        let cand = match edge {
+                            "up" => neighbors.up,
+                            "down" => neighbors.down,
+                            "left" => neighbors.left,
+                            "right" => neighbors.right,
+                            _ => None,
+                        };
+                        if let Some(target_node) = cand {
+                            let target_id = target_node.id.clone();
+                            let sess_opt = hub
+                                .sessions
+                                .read()
+                                .ok()
+                                .and_then(|s| s.get(&target_id).cloned());
+                            if let Some(sess) = sess_opt {
+                                guard.cursor.active_node_id = target_id.clone();
+                                guard.cursor.x = norm_x;
+                                guard.cursor.y = norm_y;
+                                guard.cursor.transition_count += 1;
+                                guard.cursor.last_transition_edge = Some(edge.to_string());
+                                guard.router.active_node_id = target_id.clone();
+                                guard.router.norm_x = norm_x;
+                                guard.router.norm_y = norm_y;
+                                HandoffDecision::Proceed(sess, target_id)
+                            } else {
+                                HandoffDecision::AbortReleaseLocal
+                            }
+                        } else {
+                            HandoffDecision::AbortReleaseLocal
+                        }
+                    }
                 }
-                let local_id = guard.data.local_node_id.clone();
-                let neighbors = compute_neighbors(&guard.data.nodes, &local_id);
-                let cand = match edge {
-                    "up" => neighbors.up,
-                    "down" => neighbors.down,
-                    "left" => neighbors.left,
-                    "right" => neighbors.right,
-                    _ => None,
-                };
-                let Some(target_node) = cand else {
-                    return;
-                };
-                let target_id = target_node.id.clone();
-                let sess_opt = hub
-                    .sessions
-                    .read()
-                    .ok()
-                    .and_then(|s| s.get(&target_id).cloned());
-                let Some(sess) = sess_opt else {
-                    return;
-                };
-
-                guard.cursor.active_node_id = target_id.clone();
-                guard.cursor.x = norm_x;
-                guard.cursor.y = norm_y;
-                guard.cursor.transition_count += 1;
-                guard.cursor.last_transition_edge = Some(edge.to_string());
-                guard.router.active_node_id = target_id.clone();
-                guard.router.norm_x = norm_x;
-                guard.router.norm_y = norm_y;
-                Some((sess, target_id))
             };
 
-            if let Some((sess, target_id)) = target_session_and_id {
-                hub.capture_ctrl.set_suppressing(true);
-                let frame = ReliableControlFrame::FocusEnter {
-                    node_id: target_id,
-                    normalized_x: norm_x,
-                    normalized_y: norm_y,
-                };
-                let _ = sess.send_reliable_frame(&frame, true).await;
-                hub.notify_frontend(app_handle);
+            match decision {
+                HandoffDecision::Proceed(sess, target_id) => {
+                    hub.capture_ctrl.set_suppressing(true);
+                    let frame = ReliableControlFrame::FocusEnter {
+                        node_id: target_id,
+                        normalized_x: norm_x,
+                        normalized_y: norm_y,
+                    };
+                    if sess.send_reliable_frame(&frame, true).await.is_err() {
+                        hub.capture_ctrl.set_suppressing(false);
+                        if let Ok(mut guard) = hub.state.write() {
+                            let local_id = guard.data.local_node_id.clone();
+                            guard.cursor.active_node_id = local_id.clone();
+                            guard.router.active_node_id = local_id;
+                        }
+                    }
+                    hub.notify_frontend(app_handle);
+                }
+                HandoffDecision::AlreadyRemote => {}
+                HandoffDecision::AbortReleaseLocal => {
+                    hub.capture_ctrl.set_suppressing(false);
+                    hub.sync_capture_edges();
+                }
             }
         }
 
@@ -469,7 +614,14 @@ async fn handle_captured_local_input(
                             ny: outcome.norm_y,
                         }
                     } else {
-                        DeltaAction::None
+                        guard.cursor.active_node_id = local_id.clone();
+                        guard.router.active_node_id = local_id;
+                        DeltaAction::ReturnLocal {
+                            prev_sess,
+                            release_keys: outcome.synthetic_symbolic_keyups,
+                            nx: 0.5,
+                            ny: 0.5,
+                        }
                     }
                 } else if let Some(sess) = sessions.get(&outcome.active_node_id).cloned() {
                     let seq = hub.datagram_seq.fetch_add(1, Ordering::Relaxed);
@@ -1043,10 +1195,9 @@ fn process_incoming_reliable_frame(
             ..
         } => {
             let (allow_text, allow_img, peer_name, local_name) = {
-                let Ok(mut guard) = hub.state.write() else {
+                let Ok(guard) = hub.state.read() else {
                     return;
                 };
-                guard.last_synced_clipboard_hash = blake3_hex.clone();
                 let pname = guard
                     .data
                     .nodes
@@ -1064,46 +1215,24 @@ fn process_incoming_reliable_frame(
 
             if let Some(txt) = text {
                 if allow_text && compute_chunk_blake3_hex(txt.as_bytes()) == blake3_hex {
-                    let _ = write_os_clipboard_text(&txt);
-                    if let Ok(mut guard) = hub.state.write() {
-                        let title = if txt.chars().count() > 48 {
-                            let p: String = txt.chars().take(48).collect();
-                            format!("{p}...")
-                        } else {
-                            txt.clone()
-                        };
-                        guard.data.transfers.insert(
-                            0,
-                            TransferRecordDto {
-                                id: format!("tr-{}", now_epoch_millis()),
-                                record_type: "clipboard-text".into(),
-                                title,
-                                size_label: format_bytes_human(txt.len()),
-                                from_node_name: peer_name,
-                                to_node_name: local_name,
-                                timestamp: now_hms_string(),
-                                encrypted: true,
-                                status: "completed".into(),
-                                digest_hex: Some(blake3_hex[0..16.min(blake3_hex.len())].to_string()),
-                            },
-                        );
-                    }
-                    hub.persist();
-                    hub.notify_frontend(app_handle);
-                }
-            } else if let Some(img) = image {
-                if allow_img {
-                    if let Ok(rgba) = decode_base64(&img.rgba_b64) {
-                        let size = rgba.len();
-                        let _ = write_os_clipboard_image(img.width, img.height, rgba);
+                    if write_os_clipboard_text(&txt).is_ok() {
+                        let new_seq = os_clipboard_sequence_token();
                         if let Ok(mut guard) = hub.state.write() {
+                            guard.last_synced_clipboard_hash = blake3_hex.clone();
+                            guard.last_os_clipboard_seq = new_seq;
+                            let title = if txt.chars().count() > 48 {
+                                let p: String = txt.chars().take(48).collect();
+                                format!("{p}...")
+                            } else {
+                                txt.clone()
+                            };
                             guard.data.transfers.insert(
                                 0,
                                 TransferRecordDto {
                                     id: format!("tr-{}", now_epoch_millis()),
-                                    record_type: "clipboard-image".into(),
-                                    title: format!("剪贴板图像 ({}×{})", img.width, img.height),
-                                    size_label: format_bytes_human(size),
+                                    record_type: "clipboard-text".into(),
+                                    title,
+                                    size_label: format_bytes_human(txt.len()),
                                     from_node_name: peer_name,
                                     to_node_name: local_name,
                                     timestamp: now_hms_string(),
@@ -1111,6 +1240,51 @@ fn process_incoming_reliable_frame(
                                     status: "completed".into(),
                                     digest_hex: Some(
                                         blake3_hex[0..16.min(blake3_hex.len())].to_string(),
+                                    ),
+                                },
+                            );
+                        }
+                        hub.persist();
+                        hub.notify_frontend(app_handle);
+                    }
+                }
+            } else if let Some(img) = image {
+                if allow_img {
+                    let png_decoded = if !img.png_b64.is_empty() {
+                        decode_base64(&img.png_b64).ok()
+                    } else {
+                        None
+                    };
+                    let rgba_decoded = if png_decoded.is_none() && !img.rgba_b64.is_empty() {
+                        decode_base64(&img.rgba_b64).ok()
+                    } else {
+                        None
+                    };
+
+                    if let Ok((w, h, canonical_hash, byte_len)) = write_os_clipboard_png_or_rgba(
+                        img.width,
+                        img.height,
+                        png_decoded.as_deref(),
+                        rgba_decoded.as_deref(),
+                    ) {
+                        let new_seq = os_clipboard_sequence_token();
+                        if let Ok(mut guard) = hub.state.write() {
+                            guard.last_synced_clipboard_hash = canonical_hash.clone();
+                            guard.last_os_clipboard_seq = new_seq;
+                            guard.data.transfers.insert(
+                                0,
+                                TransferRecordDto {
+                                    id: format!("tr-{}", now_epoch_millis()),
+                                    record_type: "clipboard-image".into(),
+                                    title: format!("剪贴板截图 ({w}×{h})"),
+                                    size_label: format_bytes_human(byte_len),
+                                    from_node_name: peer_name,
+                                    to_node_name: local_name,
+                                    timestamp: now_hms_string(),
+                                    encrypted: true,
+                                    status: "completed".into(),
+                                    digest_hex: Some(
+                                        canonical_hash[0..16.min(canonical_hash.len())].to_string(),
                                     ),
                                 },
                             );

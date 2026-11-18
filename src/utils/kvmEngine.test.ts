@@ -438,3 +438,44 @@ test('Windows Win32 0.58 PAL handle types and Linux x11rb Connection trait impor
   assert.equal(workflowYaml.includes('-p spankvm-pal'), true);
 });
 
+test('Exclusive single-machine input suppression and lossless Snipaste/WeChat image clipboard sync are wired end-to-end', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const rootDir = path.resolve(import.meta.dirname, '../..');
+
+  // 1. macOS: must bypass core-graphics 0.24 broken CGEventTap::new wrapper and return NULL (std::ptr::null_mut())
+  const macRs = fs.readFileSync(path.join(rootDir, 'crates/spankvm-pal/src/macos.rs'), 'utf-8');
+  assert.equal(
+    macRs.includes('CGEventTap::new'),
+    false,
+    'macos.rs must NOT use core_graphics::event::CGEventTap::new because returning None passes events through'
+  );
+  assert.equal(macRs.includes('CGEventTapCreate('), true);
+  assert.equal(macRs.includes('std::ptr::null_mut()'), true);
+  assert.equal(macRs.includes('CGEventSourceSetLocalEventsSuppressionInterval'), true);
+  assert.equal(macRs.includes('lock_cursor_at_center'), true);
+  assert.equal(macRs.includes('set_suppressing_from_hook(true)'), true);
+
+  // 2. Windows: Per-Monitor DPI v2 + immediate hook suppression + atomic modifier tracking
+  const winRs = fs.readFileSync(path.join(rootDir, 'crates/spankvm-pal/src/windows.rs'), 'utf-8');
+  assert.equal(winRs.includes('DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2'), true);
+  assert.equal(winRs.includes('set_suppressing_from_hook(true)'), true);
+  assert.equal(winRs.includes('LRESULT(1)'), true);
+  assert.equal(winRs.includes('ctrl_held: AtomicBool'), true);
+
+  // 3. Clipboard PAL + Tauri runtime: Snipaste/OS screenshot capture + WeChat multi-format CF_DIB & PNG output
+  const clipRs = fs.readFileSync(path.join(rootDir, 'crates/spankvm-pal/src/clipboard.rs'), 'utf-8');
+  assert.equal(clipRs.includes('pub fn read_os_clipboard_snapshot('), true);
+  assert.equal(clipRs.includes('pub fn write_os_clipboard_png_or_rgba('), true);
+  assert.equal(clipRs.includes('CF_DIB_ID'), true);
+  assert.equal(clipRs.includes('EmptyClipboard()'), true);
+  assert.equal(clipRs.includes('public.png'), true);
+
+  const runtimeRs = fs.readFileSync(path.join(rootDir, 'src-tauri/src/runtime.rs'), 'utf-8');
+  assert.equal(runtimeRs.includes('read_os_clipboard_snapshot('), true);
+  assert.equal(runtimeRs.includes('ClipboardSnapshot::Image'), true);
+  assert.equal(runtimeRs.includes('write_os_clipboard_png_or_rgba('), true);
+  assert.equal(runtimeRs.includes('os_clipboard_sequence_token()'), true);
+});
+
+

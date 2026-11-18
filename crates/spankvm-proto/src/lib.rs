@@ -238,6 +238,9 @@ pub enum WireHandshakeResponse {
 pub struct ClipboardImageWire {
     pub width: u32,
     pub height: u32,
+    #[serde(default)]
+    pub png_b64: String,
+    #[serde(default)]
     pub rgba_b64: String,
 }
 

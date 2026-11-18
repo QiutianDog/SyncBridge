@@ -17,8 +17,9 @@ use spankvm_net::{
     detect_local_hostname, detect_local_lan_ipv4, LocalEd25519Identity, QuicPeerSession,
 };
 use spankvm_pal::{
-    clipboard::write_os_clipboard_text, detect_active_driver_stack, detect_local_os_kind,
-    probe_local_display, prompt_input_permission, CaptureControlState, CrossPlatformInjector,
+    clipboard::{os_clipboard_sequence_token, write_os_clipboard_text},
+    detect_active_driver_stack, detect_local_os_kind, probe_local_display, prompt_input_permission,
+    CaptureControlState, CrossPlatformInjector,
 };
 use spankvm_proto::{
     decode_base64, encode_base64, ClipboardPolicy, DeviceNode, EngineTuning, GridPos,
@@ -134,6 +135,7 @@ pub struct SharedDaemonState {
     pub router: FocusRouter,
     pub state_file_path: Option<PathBuf>,
     pub last_synced_clipboard_hash: String,
+    pub last_os_clipboard_seq: Option<u64>,
 }
 
 pub struct DaemonHub {
@@ -649,6 +651,13 @@ pub async fn dispatch_daemon_ipc(
                 if let Some(patch) = payload.get("tuning").and_then(|v| v.as_object()) {
                     if let Some(v) = patch.get("daemonActive").and_then(|v| v.as_bool()) {
                         guard.data.tuning.daemon_active = v;
+                        if !v {
+                            let local_id = guard.data.local_node_id.clone();
+                            guard.cursor.active_node_id = local_id.clone();
+                            guard.cursor.x = 0.5;
+                            guard.cursor.y = 0.5;
+                            guard.router.active_node_id = local_id;
+                        }
                     }
                     if let Some(v) = patch.get("hidPollingHz").and_then(|v| v.as_u64()) {
                         guard.data.tuning.hid_polling_hz = v as u16;
@@ -1244,6 +1253,7 @@ pub async fn dispatch_daemon_ipc(
 
             // Write directly to local OS clipboard AND broadcast to all connected QUIC peers
             let _ = write_os_clipboard_text(&text);
+            let new_seq = os_clipboard_sequence_token();
             let digest = compute_chunk_blake3_hex(text.as_bytes());
 
             let active_sessions: Vec<QuicPeerSession> = hub
@@ -1268,6 +1278,7 @@ pub async fn dispatch_daemon_ipc(
             {
                 let mut guard = hub.state.write().map_err(|e| e.to_string())?;
                 guard.last_synced_clipboard_hash = digest.clone();
+                guard.last_os_clipboard_seq = new_seq;
                 let from_name = guard.data.tuning.local_device_name.clone();
                 let to_label = if peer_count > 0 {
                     format!("已同步至 {peer_count} 台在线设备")

@@ -1,9 +1,12 @@
 //! Windows 10 / 11 Low-Level Hook (`WH_MOUSE_LL` / `WH_KEYBOARD_LL`) + `SendInput` driver.
 //!
-//! - Captures hardware mouse movement, buttons, wheel, and keyboard events globally.
-//! - Suppresses local Windows cursor/keyboard (`LRESULT(1)`) when focus crosses onto a remote computer,
-//!   while always honoring `Ctrl + Alt + Shift + Esc` emergency return.
-//! - Injects incoming remote events via Win32 `SendInput` tagged with `SPANKVM_INJECT_MAGIC`.
+//! - Enables Per-Monitor-V2 DPI awareness on the input hook thread so `MSLLHOOKSTRUCT.pt`,
+//!   `GetCursorPos`, `SetCursorPos`, and `GetSystemMetrics` use identical 1:1 physical pixels.
+//! - Atomically engages local suppression inside `WH_MOUSE_LL` the exact moment an armed edge is
+//!   crossed, parking the local cursor at screen center and returning `LRESULT(1)` for all mouse
+//!   and keyboard messages so Machine A never moves its cursor or receives keystrokes while Machine B is active.
+//! - Tracks modifier state internally inside `WH_KEYBOARD_LL` so `Ctrl + Alt + Shift + Esc`
+//!   emergency return always works even while `WH_KEYBOARD_LL` swallows keystrokes.
 
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
@@ -16,9 +19,20 @@ use crate::{
 #[cfg(target_os = "windows")]
 const WIN_INJECT_MAGIC: usize = 0x5350_4B56;
 
+#[cfg(target_os = "windows")]
+fn enable_per_monitor_dpi_v2() {
+    unsafe {
+        use windows::Win32::UI::HiDpi::{
+            SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        };
+        let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+}
+
 pub fn probe_windows_display() -> (u32, u32, u16) {
     #[cfg(target_os = "windows")]
     unsafe {
+        enable_per_monitor_dpi_v2();
         use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
         let w = GetSystemMetrics(SM_CXSCREEN).max(1280) as u32;
         let h = GetSystemMetrics(SM_CYSCREEN).max(720) as u32;
@@ -166,6 +180,7 @@ impl InputInjectorBackend for WindowsRawInputDriver {
     fn inject_mouse_warp_normalized(&mut self, norm_x: f32, norm_y: f32) -> Result<(), PalError> {
         #[cfg(target_os = "windows")]
         unsafe {
+            enable_per_monitor_dpi_v2();
             use std::mem::size_of;
             use windows::Win32::UI::Input::KeyboardAndMouse::{
                 SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE,
@@ -257,16 +272,18 @@ impl InputInjectorBackend for WindowsRawInputDriver {
 mod win_hook_impl {
     use super::*;
     use crate::keymap::canonical_from_windows_vk;
-    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
     use std::sync::OnceLock;
     use windows::Win32::Foundation::{HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics,
-        SetWindowsHookExW, TranslateMessage, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
-        SM_CXSCREEN, SM_CYSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP,
-        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-        WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+        SetCursorPos, SetWindowsHookExW, TranslateMessage, HHOOK, KBDLLHOOKSTRUCT, MSG,
+        MSLLHOOKSTRUCT, SM_CXSCREEN, SM_CYSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN,
+        WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK,
+        WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+        WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+        WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP,
     };
 
     struct HookCtx {
@@ -274,6 +291,9 @@ mod win_hook_impl {
         tx: UnboundedSender<CapturedInputEvent>,
         last_x: AtomicI32,
         last_y: AtomicI32,
+        ctrl_held: AtomicBool,
+        alt_held: AtomicBool,
+        shift_held: AtomicBool,
     }
 
     static HOOK_CTX: OnceLock<HookCtx> = OnceLock::new();
@@ -286,10 +306,11 @@ mod win_hook_impl {
                     let msg = wparam.0 as u32;
                     let w = GetSystemMetrics(SM_CXSCREEN).max(1);
                     let h = GetSystemMetrics(SM_CYSCREEN).max(1);
-                    let prev_x = ctx.last_x.swap(info.pt.x, Ordering::Relaxed);
-                    let prev_y = ctx.last_y.swap(info.pt.y, Ordering::Relaxed);
 
                     if !ctx.ctrl.is_suppressing() {
+                        let prev_x = ctx.last_x.swap(info.pt.x, Ordering::Relaxed);
+                        let prev_y = ctx.last_y.swap(info.pt.y, Ordering::Relaxed);
+
                         if msg == WM_MOUSEMOVE {
                             let dx = info.pt.x - prev_x;
                             let dy = info.pt.y - prev_y;
@@ -297,46 +318,47 @@ mod win_hook_impl {
                             let nx = (info.pt.x as f32 / w as f32).clamp(0.0, 1.0);
                             let ny = (info.pt.y as f32 / h as f32).clamp(0.0, 1.0);
 
-                            if info.pt.x <= 1 && dx < 0 && armed[2] {
-                                let _ = ctx.tx.send(CapturedInputEvent::EdgeCrossed {
-                                    edge: "left",
-                                    norm_x: 0.98,
-                                    norm_y: ny,
-                                });
+                            let crossed = if info.pt.x <= 1 && dx < 0 && armed[2] {
+                                Some(("left", 0.98f32, ny))
                             } else if info.pt.x >= w - 2 && dx > 0 && armed[3] {
-                                let _ = ctx.tx.send(CapturedInputEvent::EdgeCrossed {
-                                    edge: "right",
-                                    norm_x: 0.02,
-                                    norm_y: ny,
-                                });
+                                Some(("right", 0.02f32, ny))
                             } else if info.pt.y <= 1 && dy < 0 && armed[0] {
-                                let _ = ctx.tx.send(CapturedInputEvent::EdgeCrossed {
-                                    edge: "up",
-                                    norm_x: nx,
-                                    norm_y: 0.98,
-                                });
+                                Some(("up", nx, 0.98f32))
                             } else if info.pt.y >= h - 2 && dy > 0 && armed[1] {
+                                Some(("down", nx, 0.02f32))
+                            } else {
+                                None
+                            };
+
+                            if let Some((edge, target_nx, target_ny)) = crossed {
+                                ctx.ctrl.set_suppressing_from_hook(true);
+                                let cx = w / 2;
+                                let cy = h / 2;
+                                let _ = SetCursorPos(cx, cy);
+                                ctx.last_x.store(cx, Ordering::Relaxed);
+                                ctx.last_y.store(cy, Ordering::Relaxed);
                                 let _ = ctx.tx.send(CapturedInputEvent::EdgeCrossed {
-                                    edge: "down",
-                                    norm_x: nx,
-                                    norm_y: 0.02,
+                                    edge,
+                                    norm_x: target_nx,
+                                    norm_y: target_ny,
                                 });
+                                return LRESULT(1);
                             }
                         }
                     } else {
                         match msg {
                             WM_MOUSEMOVE => {
-                                // When suppressed on Windows, cursor stays fixed so info.pt - prev is raw delta
                                 let mut cur = POINT::default();
                                 let _ = GetCursorPos(&mut cur);
                                 let dx = info.pt.x - cur.x;
                                 let dy = info.pt.y - cur.y;
+                                // Ignore synthetic warp event matching exact parked center
                                 if dx != 0 || dy != 0 {
                                     let _ = ctx.tx.send(CapturedInputEvent::MouseDelta { dx, dy });
                                 }
                                 return LRESULT(1);
                             }
-                            WM_LBUTTONDOWN => {
+                            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
                                 let _ = ctx.tx.send(CapturedInputEvent::MouseButton {
                                     button: 1,
                                     pressed: true,
@@ -350,7 +372,7 @@ mod win_hook_impl {
                                 });
                                 return LRESULT(1);
                             }
-                            WM_RBUTTONDOWN => {
+                            WM_RBUTTONDOWN | WM_RBUTTONDBLCLK => {
                                 let _ = ctx.tx.send(CapturedInputEvent::MouseButton {
                                     button: 2,
                                     pressed: true,
@@ -364,7 +386,7 @@ mod win_hook_impl {
                                 });
                                 return LRESULT(1);
                             }
-                            WM_MBUTTONDOWN => {
+                            WM_MBUTTONDOWN | WM_MBUTTONDBLCLK => {
                                 let _ = ctx.tx.send(CapturedInputEvent::MouseButton {
                                     button: 3,
                                     pressed: true,
@@ -394,6 +416,9 @@ mod win_hook_impl {
                                 });
                                 return LRESULT(1);
                             }
+                            WM_XBUTTONDOWN | WM_XBUTTONUP | WM_XBUTTONDBLCLK => {
+                                return LRESULT(1);
+                            }
                             _ => {}
                         }
                     }
@@ -412,14 +437,29 @@ mod win_hook_impl {
                     let pressed = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
                     let released = msg == WM_KEYUP || msg == WM_SYSKEYUP;
 
+                    if pressed || released {
+                        match info.vkCode {
+                            0x11 | 0xA2 | 0xA3 => ctx.ctrl_held.store(pressed, Ordering::Relaxed),
+                            0x12 | 0xA4 | 0xA5 => ctx.alt_held.store(pressed, Ordering::Relaxed),
+                            0x10 | 0xA0 | 0xA1 => ctx.shift_held.store(pressed, Ordering::Relaxed),
+                            _ => {}
+                        }
+                    }
+
                     if pressed && info.vkCode == 0x1B {
-                        let ctrl = GetAsyncKeyState(0x11) < 0;
-                        let alt = GetAsyncKeyState(0x12) < 0;
-                        let shift = GetAsyncKeyState(0x10) < 0;
+                        let ctrl =
+                            ctx.ctrl_held.load(Ordering::Relaxed) || GetAsyncKeyState(0x11) < 0;
+                        let alt =
+                            ctx.alt_held.load(Ordering::Relaxed) || GetAsyncKeyState(0x12) < 0;
+                        let shift =
+                            ctx.shift_held.load(Ordering::Relaxed) || GetAsyncKeyState(0x10) < 0;
                         if ctrl && alt && shift {
                             ctx.ctrl.set_suppressing(false);
+                            ctx.ctrl_held.store(false, Ordering::Relaxed);
+                            ctx.alt_held.store(false, Ordering::Relaxed);
+                            ctx.shift_held.store(false, Ordering::Relaxed);
                             let _ = ctx.tx.send(CapturedInputEvent::EmergencyReturn);
-                            return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+                            return LRESULT(1);
                         }
                     }
 
@@ -445,11 +485,16 @@ mod win_hook_impl {
             tx,
             last_x: AtomicI32::new(500),
             last_y: AtomicI32::new(500),
+            ctrl_held: AtomicBool::new(false),
+            alt_held: AtomicBool::new(false),
+            shift_held: AtomicBool::new(false),
         });
 
         std::thread::Builder::new()
             .name("spankvm-win32-llhook".into())
             .spawn(move || unsafe {
+                enable_per_monitor_dpi_v2();
+
                 let _m_hook = SetWindowsHookExW(
                     WH_MOUSE_LL,
                     Some(mouse_proc),

@@ -85,11 +85,11 @@ impl CaptureControlState {
 
     #[inline]
     pub fn is_daemon_enabled(&self) -> bool {
-        self.daemon_enabled.load(Ordering::Relaxed)
+        self.daemon_enabled.load(Ordering::Acquire)
     }
 
     pub fn set_daemon_enabled(&self, enabled: bool) {
-        self.daemon_enabled.store(enabled, Ordering::Relaxed);
+        self.daemon_enabled.store(enabled, Ordering::Release);
         if !enabled {
             self.set_suppressing(false);
         }
@@ -97,12 +97,19 @@ impl CaptureControlState {
 
     #[inline]
     pub fn is_suppressing(&self) -> bool {
-        self.suppressing_local.load(Ordering::Relaxed)
+        self.suppressing_local.load(Ordering::Acquire)
     }
 
     pub fn set_suppressing(&self, suppress: bool) {
-        self.suppressing_local.store(suppress, Ordering::Relaxed);
+        self.suppressing_local.store(suppress, Ordering::Release);
         macos::set_local_cursor_associated(!suppress);
+    }
+
+    /// Called directly inside real-time OS input hook callbacks the instant the pointer crosses an armed edge,
+    /// eliminating any async handoff window where local mouse/keyboard events could leak to Machine A.
+    #[inline]
+    pub fn set_suppressing_from_hook(&self, suppress: bool) {
+        self.suppressing_local.store(suppress, Ordering::Release);
     }
 
     /// Sets armed screen edges `[up, down, left, right]`.
@@ -120,12 +127,12 @@ impl CaptureControlState {
         if edges[3] {
             mask |= 1 << 3;
         }
-        self.armed_edges_mask.store(mask, Ordering::Relaxed);
+        self.armed_edges_mask.store(mask, Ordering::Release);
     }
 
     #[inline]
     pub fn armed_edges(&self) -> [bool; 4] {
-        let m = self.armed_edges_mask.load(Ordering::Relaxed);
+        let m = self.armed_edges_mask.load(Ordering::Acquire);
         [
             (m & (1 << 0)) != 0,
             (m & (1 << 1)) != 0,

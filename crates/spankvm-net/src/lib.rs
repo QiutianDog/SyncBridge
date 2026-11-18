@@ -366,8 +366,8 @@ pub async fn read_wire_json<T: DeserializeOwned>(recv: &mut RecvStream) -> Resul
         .await
         .map_err(|e| NetError::Transport(e.to_string()))?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 16 * 1024 * 1024 {
-        return Err(NetError::Transport("Wire frame exceeds 16MB limit".into()));
+    if len > 64 * 1024 * 1024 {
+        return Err(NetError::Transport("Wire frame exceeds 64MB limit".into()));
     }
     let mut buf = vec![0u8; len];
     recv.read_exact(&mut buf)

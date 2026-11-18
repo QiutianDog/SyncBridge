@@ -403,15 +403,53 @@ pub fn spawn_linux_capture_thread(
                     .unwrap_or((1920, 1080));
 
                 use x11rb::connection::Connection;
-                use x11rb::protocol::xproto::ConnectionExt;
+                use x11rb::protocol::xproto::{ConnectionExt, EventMask, GrabMode};
 
                 let mut prev_pos: Option<(i16, i16)> = None;
+                let mut x11_grabbed = false;
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(4));
                     if !ctrl.is_daemon_enabled() {
+                        if x11_grabbed {
+                            let _ = conn.ungrab_pointer(x11rb::CURRENT_TIME);
+                            let _ = conn.ungrab_keyboard(x11rb::CURRENT_TIME);
+                            let _ = conn.flush();
+                            x11_grabbed = false;
+                        }
                         prev_pos = None;
                         continue;
                     }
+
+                    let suppressing = ctrl.is_suppressing();
+                    if suppressing && !x11_grabbed {
+                        let _ = conn.grab_pointer(
+                            false,
+                            root,
+                            EventMask::BUTTON_PRESS
+                                | EventMask::BUTTON_RELEASE
+                                | EventMask::POINTER_MOTION,
+                            GrabMode::ASYNC,
+                            GrabMode::ASYNC,
+                            root,
+                            x11rb::NONE,
+                            x11rb::CURRENT_TIME,
+                        );
+                        let _ = conn.grab_keyboard(
+                            false,
+                            root,
+                            x11rb::CURRENT_TIME,
+                            GrabMode::ASYNC,
+                            GrabMode::ASYNC,
+                        );
+                        let _ = conn.flush();
+                        x11_grabbed = true;
+                    } else if !suppressing && x11_grabbed {
+                        let _ = conn.ungrab_pointer(x11rb::CURRENT_TIME);
+                        let _ = conn.ungrab_keyboard(x11rb::CURRENT_TIME);
+                        let _ = conn.flush();
+                        x11_grabbed = false;
+                    }
+
                     let Ok(cookie) = conn.query_pointer(root) else {
                         continue;
                     };
@@ -425,34 +463,35 @@ pub fn spawn_linux_capture_thread(
                     let dx = (cx - px) as i32;
                     let dy = (cy - py) as i32;
 
-                    if !ctrl.is_suppressing() {
+                    if !suppressing {
                         let armed = ctrl.armed_edges();
                         let nx = (cx as f32 / w.max(1) as f32).clamp(0.0, 1.0);
                         let ny = (cy as f32 / h.max(1) as f32).clamp(0.0, 1.0);
 
-                        if cx <= 1 && dx < 0 && armed[2] {
-                            let _ = tx.send(CapturedInputEvent::EdgeCrossed {
-                                edge: "left",
-                                norm_x: 0.98,
-                                norm_y: ny,
-                            });
+                        let crossed = if cx <= 1 && dx < 0 && armed[2] {
+                            Some(("left", 0.98f32, ny))
                         } else if cx as i32 >= w - 2 && dx > 0 && armed[3] {
-                            let _ = tx.send(CapturedInputEvent::EdgeCrossed {
-                                edge: "right",
-                                norm_x: 0.02,
-                                norm_y: ny,
-                            });
+                            Some(("right", 0.02f32, ny))
                         } else if cy <= 1 && dy < 0 && armed[0] {
-                            let _ = tx.send(CapturedInputEvent::EdgeCrossed {
-                                edge: "up",
-                                norm_x: nx,
-                                norm_y: 0.98,
-                            });
+                            Some(("up", nx, 0.98f32))
                         } else if cy as i32 >= h - 2 && dy > 0 && armed[1] {
+                            Some(("down", nx, 0.02f32))
+                        } else {
+                            None
+                        };
+
+                        if let Some((edge, target_nx, target_ny)) = crossed {
+                            ctrl.set_suppressing_from_hook(true);
+                            let center_x = (w / 2) as i16;
+                            let center_y = (h / 2) as i16;
+                            let _ =
+                                conn.warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, center_x, center_y);
+                            let _ = conn.flush();
+                            prev_pos = Some((center_x, center_y));
                             let _ = tx.send(CapturedInputEvent::EdgeCrossed {
-                                edge: "down",
-                                norm_x: nx,
-                                norm_y: 0.02,
+                                edge,
+                                norm_x: target_nx,
+                                norm_y: target_ny,
                             });
                         }
                     } else if dx != 0 || dy != 0 {

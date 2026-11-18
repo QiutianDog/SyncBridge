@@ -63,6 +63,7 @@ fn load_or_init_hub(app: &tauri::App) -> Arc<DaemonHub> {
         router: FocusRouter::new(local_id),
         state_file_path,
         last_synced_clipboard_hash: String::new(),
+        last_os_clipboard_seq: spankvm_pal::clipboard::os_clipboard_sequence_token(),
     };
 
     Arc::new(DaemonHub {
@@ -147,6 +148,13 @@ pub fn run() {
                         if let Some(hub) = app_handle.try_state::<Arc<DaemonHub>>() {
                             if let Ok(mut guard) = hub.state.write() {
                                 guard.data.tuning.daemon_active = !guard.data.tuning.daemon_active;
+                                if !guard.data.tuning.daemon_active {
+                                    let local_id = guard.data.local_node_id.clone();
+                                    guard.cursor.active_node_id = local_id.clone();
+                                    guard.cursor.x = 0.5;
+                                    guard.cursor.y = 0.5;
+                                    guard.router.active_node_id = local_id;
+                                }
                             }
                             hub.persist();
                             hub.notify_frontend(app_handle);
