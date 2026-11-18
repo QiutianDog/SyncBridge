@@ -1,84 +1,110 @@
 pub mod commands;
 
+use std::fs;
 use std::sync::RwLock;
-use commands::{
-    cmd_check_capacity, cmd_emergency_return_primary, cmd_move_node_cell, cmd_set_primary_node,
-    cmd_update_engine_tuning, get_daemon_snapshot, SharedDaemonState,
-};
-use spankvm_core::FocusRouter;
-use spankvm_proto::{
-    ClipboardPolicy, DeviceNode, EngineTuning, GridPos, LinuxWaylandStrategy, OsKind, Resolution,
-};
 
-fn default_daemon_state() -> SharedDaemonState {
-    let primary_id = "node-mac-studio".to_string();
-    let nodes = vec![DeviceNode {
-        id: primary_id.clone(),
-        name: "Local Primary Host".into(),
-        hostname: "localhost.local".into(),
-        os: if cfg!(target_os = "macos") {
-            OsKind::MacOs
-        } else if cfg!(target_os = "windows") {
-            OsKind::Windows
-        } else {
-            OsKind::LinuxWayland
-        },
-        ip: "192.168.50.10".into(),
-        resolution: Resolution {
-            width: 2560,
-            height: 1440,
-        },
-        refresh_rate_hz: 144,
-        is_primary: true,
-        grid_pos: GridPos { col: 2, row: 2 },
-        auto_pair: true,
-        online: true,
-        latency_ms: 0.1,
-        fingerprint: "ED25519:LOCAL:HOST".into(),
-        paired_at: "本机宿主".into(),
-    }];
+use commands::{
+    create_default_persisted_data, dispatch_daemon_ipc, get_daemon_snapshot, get_workspace_file,
+    get_workspace_files, PersistedDaemonData, SharedDaemonState,
+};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::TrayIconBuilder;
+use tauri::{Manager, RunEvent, WindowEvent};
+
+fn load_or_init_daemon_state(app: &tauri::App) -> SharedDaemonState {
+    let state_file_path = app
+        .path()
+        .app_data_dir()
+        .ok()
+        .map(|dir| dir.join("spankvm-daemon-state.json"));
+
+    let data = state_file_path
+        .as_ref()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|raw| serde_json::from_str::<PersistedDaemonData>(&raw).ok())
+        .unwrap_or_else(create_default_persisted_data);
 
     SharedDaemonState {
-        nodes,
-        router: FocusRouter::new(primary_id),
-        key_rules: Vec::new(),
-        tuning: EngineTuning {
-            daemon_active: true,
-            hid_polling_hz: 1000,
-            edge_delay_ms: 0,
-            release_hotkey: "Ctrl+Alt+Shift+Escape".into(),
-            linux_wayland_strategy: LinuxWaylandStrategy::PortalAndUinputFallback,
-        },
-        clipboard_policy: ClipboardPolicy {
-            sync_plain_text: true,
-            sync_images: true,
-            enable_drag_drop_file: true,
-            max_file_size_mb: 500,
-            save_dir: "~/Downloads/SpanKVM".into(),
-        },
-        local_ephemeral_pin: "482-915".into(),
+        data,
+        state_file_path,
     }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .manage(RwLock::new(default_daemon_state()))
+    let app = tauri::Builder::default()
+        .setup(|app| {
+            let initial_state = load_or_init_daemon_state(app);
+            app.manage(RwLock::new(initial_state));
+
+            let handle = app.handle();
+            let show_item = MenuItem::with_id(
+                handle,
+                "show",
+                "打开 SpanKVM 控制台",
+                true,
+                None::<&str>,
+            )?;
+            let quit_item = MenuItem::with_id(
+                handle,
+                "quit",
+                "退出 SpanKVM",
+                true,
+                None::<&str>,
+            )?;
+            let tray_menu = Menu::with_items(handle, &[&show_item, &quit_item])?;
+
+            let mut tray_builder = TrayIconBuilder::new()
+                .menu(&tray_menu)
+                .on_menu_event(|app_handle, event| match event.id().as_ref() {
+                    "show" => {
+                        if let Some(window) = app_handle.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    "quit" => {
+                        app_handle.exit(0);
+                    }
+                    _ => {}
+                });
+
+            if let Some(icon) = app.default_window_icon().cloned() {
+                tray_builder = tray_builder.icon(icon);
+            }
+            let _ = tray_builder.build(handle);
+
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
+            dispatch_daemon_ipc,
             get_daemon_snapshot,
-            cmd_set_primary_node,
-            cmd_move_node_cell,
-            cmd_emergency_return_primary,
-            cmd_update_engine_tuning,
-            cmd_check_capacity,
+            get_workspace_files,
+            get_workspace_file,
         ])
         .on_window_event(|window, event| {
             // Keep background Rust KVM routing daemon alive in tray when configuration window closes
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            if let WindowEvent::CloseRequested { api, .. } = event {
                 let _ = window.hide();
                 api.prevent_close();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running SpanKVM Tauri v2 application");
+        .build(tauri::generate_context!())
+        .expect("error while building SpanKVM Tauri v2 application");
+
+    app.run(|app_handle, event| {
+        #[cfg(target_os = "macos")]
+        if let RunEvent::Reopen {
+            has_visible_windows: false,
+            ..
+        } = event
+        {
+            if let Some(window) = app_handle.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (app_handle, event);
+    });
 }

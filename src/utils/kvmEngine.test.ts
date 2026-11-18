@@ -303,4 +303,61 @@ test('GitHub Actions workflow and Tauri v2 bundle icon assets are complete and c
   }
 });
 
+test('normalizeDaemonSnapshot prevents macOS Tauri white-screen crash on partial payloads and all Rust include_str! paths exist', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const { normalizeDaemonSnapshot } = await import('../services/tauriBridge');
+
+  // Simulate the exact legacy Rust payload that lacked `cursor`, `discoveredPeers`, and `transfers`
+  const legacyRustPayload = {
+    nodes: sampleNodes,
+    activeNodeId: 'win-rig',
+    cursorX: 0.72,
+    cursorY: 0.35,
+    transitionCount: 3,
+    keyRules: [],
+    tuning: {
+      daemonActive: true,
+      hidPollingHz: 1000,
+      edgeDelayMs: 0,
+      releaseHotkey: 'Ctrl + Alt + Shift + Esc',
+      linuxWaylandStrategy: 'portal-and-uinput-fallback',
+    },
+    clipboardPolicy: {
+      syncPlainText: true,
+      syncImages: true,
+      enableDragDropFile: true,
+      maxFileSizeMb: 500,
+      saveDir: '~/Downloads/SpanKVM',
+    },
+    localEphemeralPin: '482-915',
+    activeDriverName: 'macOS CoreGraphics CGEventTap + CGEventPost',
+  };
+
+  const normalized = normalizeDaemonSnapshot(legacyRustPayload);
+  assert.equal(normalized.cursor.activeNodeId, 'win-rig');
+  assert.equal(normalized.cursor.x, 0.72);
+  assert.equal(normalized.cursor.y, 0.35);
+  assert.equal(normalized.cursor.transitionCount, 3);
+  assert.equal(Array.isArray(normalized.discoveredPeers), true);
+  assert.equal(Array.isArray(normalized.transfers), true);
+
+  // Verify every include_str!("...") path in src-tauri/src/commands.rs resolves to a real file
+  const rootDir = path.resolve(import.meta.dirname, '../..');
+  const commandsRsDir = path.join(rootDir, 'src-tauri/src');
+  const commandsRs = fs.readFileSync(path.join(commandsRsDir, 'commands.rs'), 'utf-8');
+  const matches = [...commandsRs.matchAll(/include_str!\("([^"]+)"\)/g)];
+  assert.equal(matches.length >= 14, true, 'commands.rs must embed workspace source files');
+
+  for (const m of matches) {
+    const targetFile = path.resolve(commandsRsDir, m[1]);
+    assert.equal(
+      fs.existsSync(targetFile),
+      true,
+      `Broken include_str! path in commands.rs: ${m[1]} -> ${targetFile}`
+    );
+  }
+});
+
+
 

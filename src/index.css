@@ -2,9 +2,9 @@
 @custom-variant dark (&:is(.dark, .dark *));
 
 @theme {
-  --font-display: "Plus Jakarta Sans", "Noto Sans SC", system-ui, sans-serif;
-  --font-sans: "DM Sans", "Noto Sans SC", system-ui, sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  --font-display: "Plus Jakarta Sans", "Noto Sans SC", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+  --font-sans: "DM Sans", "Noto Sans SC", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", Menlo, Monaco, Consolas, ui-monospace, monospace;
 }
 
 @layer base {

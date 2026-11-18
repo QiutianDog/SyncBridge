@@ -12,6 +12,7 @@ import {
   WorkspaceFileEntry,
   fetchWorkspaceFileContent,
   fetchWorkspaceManifest,
+  isTauriNativeRuntime,
 } from '../services/tauriBridge';
 import type { EngineTuning, LinuxWaylandStrategy } from '../utils/kvmEngine';
 
@@ -86,14 +87,25 @@ export const WorkspaceSourceExplorer: React.FC<WorkspaceSourceExplorerProps> = (
           </p>
         </div>
 
-        <a
-          href="/api/workspace/bundle.tar.gz"
-          download="spankvm-rust-tauri-v2-workspace.tar.gz"
-          className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors whitespace-nowrap shrink-0"
-        >
-          <Download className="w-3.5 h-3.5" />
-          打包下载完整工程 (.tar.gz)
-        </a>
+        {isTauriNativeRuntime() ? (
+          <button
+            type="button"
+            onClick={handleCopySource}
+            className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors whitespace-nowrap shrink-0"
+          >
+            {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+            <span>{copied ? '已复制当前模块源码' : '复制当前模块源码'}</span>
+          </button>
+        ) : (
+          <a
+            href="/api/workspace/bundle.tar.gz"
+            download="spankvm-rust-tauri-v2-workspace.tar.gz"
+            className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors whitespace-nowrap shrink-0"
+          >
+            <Download className="w-3.5 h-3.5" />
+            打包下载完整工程 (.tar.gz)
+          </a>
+        )}
       </div>
 
       {/* Confirmed Option A & Option B Runtime Configuration Strip */}

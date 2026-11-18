@@ -107,9 +107,14 @@ export default function App() {
   const [keyRules, setKeyRules] = useState<KeyMappingRule[]>(INITIAL_KEY_RULES);
   const [transfers, setTransfers] = useState<TransferRecord[]>(INITIAL_TRANSFERS);
 
+  const [htmlCopiedNotice, setHtmlCopiedNotice] = useState<boolean>(false);
+
   const applySnapshot = useCallback((snap?: DaemonSnapshot) => {
     if (!snap) return;
     setNodes(snap.nodes);
+    setSelectedNodeId((prev) =>
+      snap.nodes.some((n) => n.id === prev) ? prev : (snap.nodes[0]?.id ?? prev)
+    );
     setDiscoveredPeers(snap.discoveredPeers);
     setCursor(snap.cursor);
     setTuning(snap.tuning);
@@ -295,12 +300,18 @@ export default function App() {
     if (res.ok) applySnapshot(res.snapshot);
   };
 
-  const handleExportSampleHtml = () => {
+  const handleExportSampleHtml = async () => {
     const htmlContent = generateStandaloneSampleHtml(
       nodes,
       keyRules,
       localEphemeralPin
     );
+    if (isTauriNativeRuntime()) {
+      await navigator.clipboard.writeText(htmlContent);
+      setHtmlCopiedNotice(true);
+      setTimeout(() => setHtmlCopiedNotice(false), 2000);
+      return;
+    }
     const blob = new Blob([htmlContent], { type: 'text/html;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
@@ -316,7 +327,7 @@ export default function App() {
     NAV_ITEMS.find((item) => item.id === activeTab)?.label ?? '屏幕拓扑与主屏';
   const primaryNode = nodes.find((n) => n.isPrimary) ?? nodes[0];
   const activeFocusNode =
-    nodes.find((n) => n.id === cursor.activeNodeId) ?? primaryNode;
+    nodes.find((n) => n.id === cursor?.activeNodeId) ?? primaryNode;
   const isTauri = isTauriNativeRuntime();
 
   return (
@@ -413,7 +424,13 @@ export default function App() {
               className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
             >
               <Download className="w-3.5 h-3.5" />
-              <span>导出拓扑快照 HTML</span>
+              <span>
+                {htmlCopiedNotice
+                  ? '已复制拓扑快照 HTML'
+                  : isTauri
+                    ? '复制拓扑快照 HTML'
+                    : '导出拓扑快照 HTML'}
+              </span>
             </button>
           </div>
         </header>
@@ -469,7 +486,7 @@ export default function App() {
             <KeyMappingView
               rules={keyRules}
               nodes={nodes}
-              activeFocusNodeId={cursor.activeNodeId}
+              activeFocusNodeId={cursor?.activeNodeId ?? primaryNode?.id ?? ''}
               onToggleRule={handleToggleKeyRule}
               onDeleteRule={handleDeleteKeyRule}
               onAddRule={handleAddKeyRule}

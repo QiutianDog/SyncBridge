@@ -12,4 +12,5 @@
 !/src/data/**
 /.playwright-cli/
 /release-artifacts/
+/public/assets/aistudio/
 
