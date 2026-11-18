@@ -271,8 +271,23 @@ test('GitHub Actions workflow and Tauri v2 bundle icon assets are complete and c
       `workflow must build target ${requiredTarget}`
     );
   }
-  assert.equal(workflowYaml.includes('actions/upload-artifact@v4'), true);
+  assert.equal(workflowYaml.includes('actions/upload-artifact@v7'), true);
   assert.equal(workflowYaml.includes('workflow_dispatch:'), true);
+
+  // Regression guard for GitHub sync: .gitignore must anchor /data/ so src/data/seedData.ts is tracked
+  const gitignoreContent = fs.readFileSync(path.join(rootDir, '.gitignore'), 'utf-8');
+  const gitignoreLines = gitignoreContent.split(/\r?\n/).map((l) => l.trim());
+  assert.equal(
+    gitignoreLines.includes('data/'),
+    false,
+    '.gitignore must not contain un-anchored "data/" which ignores src/data/seedData.ts'
+  );
+  assert.equal(gitignoreLines.includes('/data/'), true);
+  assert.equal(
+    fs.existsSync(path.join(rootDir, 'src/data/seedData.ts')),
+    true,
+    'src/data/seedData.ts must exist for frontend and daemon builds'
+  );
 
   const tauriConfPath = path.join(rootDir, 'src-tauri/tauri.conf.json');
   const tauriConf = JSON.parse(fs.readFileSync(tauriConfPath, 'utf-8')) as {

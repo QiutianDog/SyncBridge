@@ -33,10 +33,10 @@ jobs:
         shell: bash
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
 
@@ -86,7 +86,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Linux system dependencies (WebKitGTK 4.1 + Tray + FUSE)
         if: runner.os == 'Linux'
@@ -107,7 +107,7 @@ jobs:
             xdg-utils
 
       - name: Setup Node.js 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
 
@@ -169,7 +169,7 @@ jobs:
           for ROOT_CANDIDATE in "target/${{ matrix.rust_target }}/$PROFILE_DIR" "src-tauri/target/${{ matrix.rust_target }}/$PROFILE_DIR"; do
             if [ -d "$ROOT_CANDIDATE/bundle" ]; then
               find "$ROOT_CANDIDATE/bundle" -maxdepth 3 -type f \
-                \( -name "*.dmg" -o -name "*.msi" -o -name "*-setup.exe" -o -name "*.deb" -o -name "*.rpm" -o -name "*.AppImage" \) \
+                \( -name "*.dmg" -o -name "*.msi" -o -name "*-setup.exe" -o -path "*/nsis/*.exe" -o -name "*.deb" -o -name "*.rpm" -o -iname "*.appimage" \) \
                 -exec cp -v {} "$OUT_DIR/" \;
 
               if [ "${{ runner.os }}" = "macOS" ] && [ -d "$ROOT_CANDIDATE/bundle/macos/SpanKVM.app" ]; then
@@ -217,6 +217,7 @@ jobs:
 
           (
             cd "$OUT_DIR"
+            rm -f SHA256SUMS.txt
             if command -v sha256sum >/dev/null 2>&1; then
               sha256sum * > SHA256SUMS.txt
             else
@@ -230,13 +231,14 @@ jobs:
             echo "| 构建产物文件名 | SHA-256 校验值 |"
             echo "| :--- | :--- |"
             while read -r hash fname; do
-              echo "| \`$fname\` | \`$hash\` |"
+              clean_name="${fname#\*}"
+              echo "| \`$clean_name\` | \`$hash\` |"
             done < "$OUT_DIR/SHA256SUMS.txt"
             echo ""
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Build Artifact (${{ matrix.artifact_name }})
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact_name }}
           path: release-artifacts/${{ matrix.artifact_name }}/*
@@ -252,7 +254,7 @@ jobs:
       contents: write
     steps:
       - name: Download all platform artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: release-bundle
           merge-multiple: false

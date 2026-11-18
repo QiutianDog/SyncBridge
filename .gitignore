@@ -1,13 +1,15 @@
-node_modules/
-build/
-dist/
-coverage/
+/node_modules/
+/build/
+/dist/
+/coverage/
 .DS_Store
 *.log
 .env*
 !.env.example
-target/
-data/
-.playwright-cli/
-release-artifacts/
+/target/
+/data/
+!/src/data/
+!/src/data/**
+/.playwright-cli/
+/release-artifacts/
 

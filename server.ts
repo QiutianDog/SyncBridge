@@ -131,6 +131,7 @@ const WORKSPACE_FILES: { path: string; category: string; summary: string }[] = [
   { path: 'src-tauri/src/lib.rs', category: 'Tauri v2', summary: 'Tauri v2 应用生命周期与关闭窗口转入后台托盘守护' },
   { path: 'src-tauri/src/commands.rs', category: 'Tauri v2', summary: 'Tauri v2 #[tauri::command] 前端 IPC 桥接处理器' },
   { path: 'scripts/setup-linux-uinput.sh', category: 'Linux 辅助脚本', summary: 'Linux Wayland 后备 /dev/uinput 免 root udev 权限一键配置脚本' },
+  { path: 'src/data/seedData.ts', category: '前端拓扑预设数据', summary: '默认 4 屏 / 9 屏九宫格拓扑预设与按键映射种子配置' },
   { path: 'README.md', category: '构建文档', summary: 'macOS / Windows / Linux Wayland 本地编译与打包说明' },
 ];
 
@@ -264,7 +265,7 @@ async function startServer() {
       case 'load_nine_preset': {
         state.nodes = structuredClone(NINE_GRID_PRESET);
         state.discoveredPeers = INITIAL_DISCOVERED_PEERS.filter(
-          (p) => !NINE_GRID_PRESET.some((n) => n.id === p.id)
+          (p: DiscoveredPeer) => !NINE_GRID_PRESET.some((n: DeviceNode) => n.id === p.id)
         );
         state.cursor = {
           activeNodeId: NINE_GRID_PRESET[0].id,
