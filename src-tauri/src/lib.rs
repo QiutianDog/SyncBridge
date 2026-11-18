@@ -16,7 +16,9 @@ use spankvm_pal::{CaptureControlState, CrossPlatformInjector};
 use spankvm_proto::{ReliableControlFrame, DEFAULT_QUIC_PORT};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, RunEvent, WindowEvent};
+use tauri::{AppHandle, Manager, WindowEvent};
+#[cfg(target_os = "macos")]
+use tauri::RunEvent;
 
 fn show_and_focus_main_window(app_handle: &AppHandle) {
     if let Some(window) = app_handle.get_webview_window("main") {
@@ -91,7 +93,7 @@ pub fn run() {
 
             #[cfg(target_os = "macos")]
             if initial_hide_dock {
-                app.set_dock_visibility(false);
+                let _ = app.set_dock_visibility(false);
             }
             #[cfg(not(target_os = "macos"))]
             let _ = initial_hide_dock;

@@ -400,3 +400,41 @@ test('normalizeDaemonSnapshot, system tray left/right-click wiring, and macOS Do
     );
   }
 });
+
+test('Windows Win32 0.58 PAL handle types and Linux x11rb Connection trait imports remain regression-free', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const rootDir = path.resolve(import.meta.dirname, '../..');
+
+  const winRs = fs.readFileSync(path.join(rootDir, 'crates/spankvm-pal/src/windows.rs'), 'utf-8');
+  assert.equal(
+    winRs.includes('Option::<HHOOK>::None') ||
+      winRs.includes('Option::<HINSTANCE>::None') ||
+      winRs.includes('Option::<HWND>::None'),
+    false,
+    'windows.rs must not pass Option::<HHOOK/HINSTANCE/HWND>::None to windows 0.58 CopyType APIs'
+  );
+  assert.equal(winRs.includes('HHOOK::default()'), true);
+  assert.equal(winRs.includes('HINSTANCE::default()'), true);
+  assert.equal(winRs.includes('HWND::default()'), true);
+
+  const linuxRs = fs.readFileSync(
+    path.join(rootDir, 'crates/spankvm-pal/src/linux_wayland.rs'),
+    'utf-8'
+  );
+  const probeBlock = linuxRs.slice(
+    linuxRs.indexOf('pub fn probe_linux_display()'),
+    linuxRs.indexOf('pub struct LinuxDualStackDriver')
+  );
+  assert.equal(
+    probeBlock.includes('use x11rb::connection::Connection;'),
+    true,
+    'probe_linux_display must import x11rb::connection::Connection before calling conn.setup()'
+  );
+
+  const workflowYaml = fs.readFileSync(path.join(rootDir, '.github/workflows/build.yml'), 'utf-8');
+  assert.equal(workflowYaml.includes('NO_STRIP: true'), true);
+  assert.equal(workflowYaml.includes('pkg-config'), true);
+  assert.equal(workflowYaml.includes('-p spankvm-pal'), true);
+});
+

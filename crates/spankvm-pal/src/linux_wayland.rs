@@ -45,6 +45,7 @@ pub fn is_linux_input_permitted() -> bool {
 pub fn probe_linux_display() -> (u32, u32, u16) {
     #[cfg(target_os = "linux")]
     {
+        use x11rb::connection::Connection;
         if let Ok((conn, screen_num)) = x11rb::connect(None) {
             if let Some(screen) = conn.setup().roots.get(screen_num) {
                 let w = (screen.width_in_pixels as u32).max(1280);

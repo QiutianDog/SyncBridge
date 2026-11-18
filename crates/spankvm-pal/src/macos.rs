@@ -11,8 +11,10 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
     CaptureControlState, CapturedInputEvent, InputCaptureBackend, InputInjectorBackend, PalError,
-    RawInputEvent, SPANKVM_INJECT_MAGIC,
+    RawInputEvent,
 };
+#[cfg(target_os = "macos")]
+use crate::SPANKVM_INJECT_MAGIC;
 
 #[cfg(target_os = "macos")]
 #[link(name = "ApplicationServices", kind = "framework")]

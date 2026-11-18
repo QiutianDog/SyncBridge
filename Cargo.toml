@@ -12,7 +12,6 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-authors = ["SpanKVM Contributors"]
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }

@@ -400,7 +400,7 @@ mod win_hook_impl {
                 }
             }
         }
-        CallNextHookEx(Option::<HHOOK>::None, code, wparam, lparam)
+        CallNextHookEx(HHOOK::default(), code, wparam, lparam)
     }
 
     unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -419,7 +419,7 @@ mod win_hook_impl {
                         if ctrl && alt && shift {
                             ctx.ctrl.set_suppressing(false);
                             let _ = ctx.tx.send(CapturedInputEvent::EmergencyReturn);
-                            return CallNextHookEx(Option::<HHOOK>::None, code, wparam, lparam);
+                            return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
                         }
                     }
 
@@ -436,7 +436,7 @@ mod win_hook_impl {
                 }
             }
         }
-        CallNextHookEx(Option::<HHOOK>::None, code, wparam, lparam)
+        CallNextHookEx(HHOOK::default(), code, wparam, lparam)
     }
 
     pub fn spawn(ctrl: Arc<CaptureControlState>, tx: UnboundedSender<CapturedInputEvent>) {
@@ -453,19 +453,19 @@ mod win_hook_impl {
                 let _m_hook = SetWindowsHookExW(
                     WH_MOUSE_LL,
                     Some(mouse_proc),
-                    Option::<HINSTANCE>::None,
+                    HINSTANCE::default(),
                     0,
                 );
                 let _k_hook = SetWindowsHookExW(
                     WH_KEYBOARD_LL,
                     Some(keyboard_proc),
-                    Option::<HINSTANCE>::None,
+                    HINSTANCE::default(),
                     0,
                 );
                 let _ = HMODULE::default();
 
                 let mut msg = MSG::default();
-                while GetMessageW(&mut msg, Option::<HWND>::None, 0, 0).as_bool() {
+                while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
