@@ -493,7 +493,21 @@ test('Exclusive single-machine input suppression and lossless Snipaste/WeChat im
   assert.equal(runtimeRs.includes('os_clipboard_sequence_token()'), true);
   assert.equal(runtimeRs.includes('last_edge_cross_at'), true);
   assert.equal(runtimeRs.includes('arm_edge_cooldown_ms(120)'), true);
+  assert.equal(runtimeRs.includes('bind_lan_udp_listener('), true);
+
+  // 4. macOS Sequoia Local Network Privacy + multi-NIC broadcast bypassing Clash/VPN TUN
+  const infoPlistPath = path.join(rootDir, 'src-tauri/Info.plist');
+  assert.equal(fs.existsSync(infoPlistPath), true, 'src-tauri/Info.plist must exist for macOS Sequoia');
+  const infoPlist = fs.readFileSync(infoPlistPath, 'utf-8');
+  assert.equal(infoPlist.includes('NSLocalNetworkUsageDescription'), true);
+
+  const netRs = fs.readFileSync(path.join(rootDir, 'crates/spankvm-net/src/lib.rs'), 'utf-8');
+  assert.equal(netRs.includes('enumerate_lan_ipv4_interfaces('), true);
+  assert.equal(netRs.includes('bind_lan_udp_listener('), true);
+  assert.equal(netRs.includes('is_cgnat_or_bench_ipv4('), true);
+  assert.equal(netRs.includes('if_addrs::get_if_addrs()'), true);
 });
+
 
 
 

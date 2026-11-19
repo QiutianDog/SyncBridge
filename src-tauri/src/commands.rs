@@ -178,7 +178,14 @@ impl DaemonHub {
         let visible_peers: Vec<DiscoveredPeerDto> = guard
             .discovered_peers
             .iter()
-            .filter(|p| p.id != guard.data.local_node_id && !nodes.iter().any(|n| n.id == p.id))
+            .filter(|p| {
+                p.id != guard.data.local_node_id
+                    && !nodes.iter().any(|n| {
+                        n.id == p.id
+                            && (sessions.contains_key(&n.id)
+                                || (n.auto_pair && n.fingerprint == p.fingerprint))
+                    })
+            })
             .cloned()
             .collect();
 
@@ -477,6 +484,11 @@ pub async fn dispatch_daemon_ipc(
 
         "scan_lan_peers" => {
             hub.emit_beacon_now();
+            let hub_burst = Arc::clone(&hub);
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(180)).await;
+                hub_burst.emit_beacon_now();
+            });
             Ok(IpcEnvelope {
                 ok: true,
                 snapshot: Some(hub.build_snapshot()),

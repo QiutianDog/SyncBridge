@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 use spankvm_core::{compute_neighbors, find_next_adjacent_slot, resolve_mapped_key};
 use spankvm_net::{
-    build_quic_dual_endpoint, client_reconnect_trusted_over_quic, compute_chunk_blake3_hex,
-    derive_spake2_confirm_tags, is_lan_private_address, read_wire_json, write_wire_json,
-    LocalEd25519Identity, QuicPeerSession,
+    bind_lan_udp_listener, build_quic_dual_endpoint, client_reconnect_trusted_over_quic,
+    compute_chunk_blake3_hex, derive_spake2_confirm_tags, is_lan_private_address, read_wire_json,
+    write_wire_json, LocalEd25519Identity, NetError, QuicPeerSession,
 };
 use spankvm_pal::{
     clipboard::{
@@ -26,7 +26,6 @@ use spankvm_proto::{
     DEFAULT_QUIC_PORT, DISCOVERY_UDP_PORT, MAX_DEVICES,
 };
 use tauri::AppHandle;
-use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::commands::{
@@ -77,12 +76,16 @@ pub fn start_background_services(hub: Arc<DaemonHub>, app_handle: AppHandle) {
                 }
             });
 
-            // 2b. UDP LAN Discovery Beacon Broadcaster Task
+            // 2b. UDP LAN Discovery Beacon Broadcaster Task (fast startup burst + 2s interval)
             let hub_bcast = Arc::clone(&hub);
             tauri::async_runtime::spawn(async move {
+                hub_bcast.emit_beacon_now();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                hub_bcast.emit_beacon_now();
+                tokio::time::sleep(Duration::from_millis(700)).await;
                 loop {
                     hub_bcast.emit_beacon_now();
-                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
                 }
             });
 
@@ -91,115 +94,155 @@ pub fn start_background_services(hub: Arc<DaemonHub>, app_handle: AppHandle) {
             let app_disc = app_handle.clone();
             let ep_disc = endpoint.clone();
             tauri::async_runtime::spawn(async move {
-                if let Ok(sock) = TokioUdpSocket::bind(("0.0.0.0", DISCOVERY_UDP_PORT)).await {
-                    let mut buf = [0u8; 4096];
-                    loop {
-                        let Ok((len, src_addr)) = sock.recv_from(&mut buf).await else {
-                            continue;
-                        };
-                        if !is_lan_private_address(src_addr.ip()) {
-                            continue;
+                let mut bound_sock = None;
+                for _attempt in 0..10 {
+                    match bind_lan_udp_listener(DISCOVERY_UDP_PORT) {
+                        Ok(s) => {
+                            bound_sock = Some(s);
+                            break;
                         }
-                        let Ok(beacon) = serde_json::from_slice::<LanDiscoveryBeacon>(&buf[..len])
-                        else {
+                        Err(_) => {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+                let Some(sock) = bound_sock else {
+                    return;
+                };
+
+                let mut buf = [0u8; 4096];
+                let mut last_reconnect_attempt: HashMap<String, Instant> = HashMap::new();
+                loop {
+                    let Ok((len, src_addr)) = sock.recv_from(&mut buf).await else {
+                        continue;
+                    };
+                    if !is_lan_private_address(src_addr.ip()) {
+                        continue;
+                    }
+                    let Ok(beacon) = serde_json::from_slice::<LanDiscoveryBeacon>(&buf[..len])
+                    else {
+                        continue;
+                    };
+                    if beacon.magic != LanDiscoveryBeacon::MAGIC {
+                        continue;
+                    }
+
+                    let now_ms = now_epoch_millis() as u64;
+                    let mut should_notify = false;
+                    let mut auto_reconnect_target: Option<(String, SocketAddr)> = None;
+                    let peer_node_id = beacon.node_id.clone();
+
+                    {
+                        let Ok(mut guard) = hub_disc.state.write() else {
                             continue;
                         };
-                        if beacon.magic != LanDiscoveryBeacon::MAGIC {
+                        if beacon.node_id == guard.data.local_node_id {
                             continue;
                         }
 
-                        let now_ms = now_epoch_millis() as u64;
-                        let mut should_notify = false;
-                        let mut auto_reconnect_target: Option<SocketAddr> = None;
+                        // Prune stale unpaired peers older than 15s
+                        let before_len = guard.discovered_peers.len();
+                        guard
+                            .discovered_peers
+                            .retain(|p| now_ms.saturating_sub(p.last_seen_ms) < 15_000);
+                        if guard.discovered_peers.len() != before_len {
+                            should_notify = true;
+                        }
 
+                        // Check if already paired
+                        let mut show_in_discovered = true;
+                        if let Some(paired) = guard
+                            .data
+                            .nodes
+                            .iter_mut()
+                            .find(|n| n.id == beacon.node_id)
                         {
-                            let Ok(mut guard) = hub_disc.state.write() else {
-                                continue;
-                            };
-                            if beacon.node_id == guard.data.local_node_id {
-                                continue;
+                            paired.ip = src_addr.ip().to_string();
+                            paired.resolution = beacon.resolution;
+                            let already_connected = hub_disc
+                                .sessions
+                                .read()
+                                .map(|s| s.contains_key(&beacon.node_id))
+                                .unwrap_or(false);
+                            let trusted_match =
+                                paired.auto_pair && paired.fingerprint == beacon.fingerprint;
+                            if already_connected || trusted_match {
+                                show_in_discovered = false;
                             }
-
-                            // Prune stale unpaired peers older than 15s
-                            let before_len = guard.discovered_peers.len();
-                            guard
-                                .discovered_peers
-                                .retain(|p| now_ms.saturating_sub(p.last_seen_ms) < 15_000);
-                            if guard.discovered_peers.len() != before_len {
-                                should_notify = true;
-                            }
-
-                            // Check if already paired
-                            if let Some(paired) = guard
-                                .data
-                                .nodes
-                                .iter_mut()
-                                .find(|n| n.id == beacon.node_id)
-                            {
-                                paired.ip = src_addr.ip().to_string();
-                                paired.resolution = beacon.resolution;
-                                let already_connected = hub_disc
-                                    .sessions
-                                    .read()
-                                    .map(|s| s.contains_key(&beacon.node_id))
-                                    .unwrap_or(false);
-                                if paired.auto_pair
-                                    && paired.fingerprint == beacon.fingerprint
-                                    && !already_connected
-                                {
-                                    auto_reconnect_target =
-                                        Some(SocketAddr::new(src_addr.ip(), beacon.quic_port));
+                            if trusted_match && !already_connected {
+                                let can_retry = last_reconnect_attempt
+                                    .get(&beacon.node_id)
+                                    .map(|t| t.elapsed() >= Duration::from_secs(5))
+                                    .unwrap_or(true);
+                                if can_retry {
+                                    last_reconnect_attempt
+                                        .insert(beacon.node_id.clone(), Instant::now());
+                                    auto_reconnect_target = Some((
+                                        beacon.node_id.clone(),
+                                        SocketAddr::new(src_addr.ip(), beacon.quic_port),
+                                    ));
                                 }
-                            } else {
-                                // Update or insert into discovered_peers
-                                if let Some(existing) = guard
-                                    .discovered_peers
-                                    .iter_mut()
-                                    .find(|p| p.id == beacon.node_id)
+                            }
+                        }
+
+                        if show_in_discovered {
+                            // Update or insert into discovered_peers
+                            if let Some(existing) = guard
+                                .discovered_peers
+                                .iter_mut()
+                                .find(|p| p.id == beacon.node_id)
+                            {
+                                if existing.fingerprint != beacon.fingerprint
+                                    || existing.ip != src_addr.ip().to_string()
                                 {
-                                    existing.ip = src_addr.ip().to_string();
-                                    existing.quic_port = beacon.quic_port;
-                                    existing.name = beacon.name;
-                                    existing.resolution = beacon.resolution;
-                                    existing.refresh_rate_hz = beacon.refresh_rate_hz;
-                                    existing.last_seen_ms = now_ms;
-                                } else {
-                                    guard.discovered_peers.push(DiscoveredPeerDto {
-                                        id: beacon.node_id,
-                                        name: beacon.name,
-                                        hostname: beacon.hostname,
-                                        os: beacon.os,
-                                        ip: src_addr.ip().to_string(),
-                                        quic_port: beacon.quic_port,
-                                        resolution: beacon.resolution,
-                                        refresh_rate_hz: beacon.refresh_rate_hz,
-                                        latency_ms: 0.5,
-                                        fingerprint: beacon.fingerprint,
-                                        last_seen_ms: now_ms,
-                                    });
                                     should_notify = true;
                                 }
+                                existing.ip = src_addr.ip().to_string();
+                                existing.quic_port = beacon.quic_port;
+                                existing.name = beacon.name;
+                                existing.resolution = beacon.resolution;
+                                existing.refresh_rate_hz = beacon.refresh_rate_hz;
+                                existing.fingerprint = beacon.fingerprint;
+                                existing.last_seen_ms = now_ms;
+                            } else {
+                                guard.discovered_peers.push(DiscoveredPeerDto {
+                                    id: beacon.node_id,
+                                    name: beacon.name,
+                                    hostname: beacon.hostname,
+                                    os: beacon.os,
+                                    ip: src_addr.ip().to_string(),
+                                    quic_port: beacon.quic_port,
+                                    resolution: beacon.resolution,
+                                    refresh_rate_hz: beacon.refresh_rate_hz,
+                                    latency_ms: 0.5,
+                                    fingerprint: beacon.fingerprint,
+                                    last_seen_ms: now_ms,
+                                });
+                                should_notify = true;
                             }
                         }
+                    }
 
-                        if should_notify {
-                            hub_disc.notify_frontend(&app_disc);
-                        }
+                    if should_notify {
+                        hub_disc.notify_frontend(&app_disc);
+                    }
 
-                        if let Some(target_sock) = auto_reconnect_target {
-                            let hub_rc = Arc::clone(&hub_disc);
-                            let app_rc = app_disc.clone();
-                            let ep_rc = ep_disc.clone();
-                            tauri::async_runtime::spawn(async move {
-                                let local_node = hub_rc.local_node_descriptor();
-                                if let Ok((sess, remote_node)) = client_reconnect_trusted_over_quic(
-                                    &ep_rc,
-                                    target_sock,
-                                    local_node,
-                                    &hub_rc.identity,
-                                )
-                                .await
-                                {
+                    if let Some((target_id, target_sock)) = auto_reconnect_target {
+                        let hub_rc = Arc::clone(&hub_disc);
+                        let app_rc = app_disc.clone();
+                        let ep_rc = ep_disc.clone();
+                        let peer_id_for_log = peer_node_id;
+                        tauri::async_runtime::spawn(async move {
+                            let local_node = hub_rc.local_node_descriptor();
+                            match client_reconnect_trusted_over_quic(
+                                &ep_rc,
+                                target_sock,
+                                local_node,
+                                &hub_rc.identity,
+                            )
+                            .await
+                            {
+                                Ok((sess, remote_node)) => {
                                     if let Ok(mut g) = hub_rc.state.write() {
                                         if let Some(n) = g
                                             .data
@@ -211,11 +254,31 @@ pub fn start_background_services(hub: Arc<DaemonHub>, app_handle: AppHandle) {
                                             n.ip = target_sock.ip().to_string();
                                         }
                                     }
-                                    register_and_spawn_peer_session(hub_rc.clone(), app_rc.clone(), sess);
+                                    register_and_spawn_peer_session(
+                                        hub_rc.clone(),
+                                        app_rc.clone(),
+                                        sess,
+                                    );
                                     hub_rc.notify_frontend(&app_rc);
                                 }
-                            });
-                        }
+                                Err(NetError::PeerRejected(_)) => {
+                                    // Remote side removed pairing or reinstalled: disable auto_pair so user can re-pair via PIN
+                                    if let Ok(mut g) = hub_rc.state.write() {
+                                        if let Some(n) = g
+                                            .data
+                                            .nodes
+                                            .iter_mut()
+                                            .find(|n| n.id == target_id || n.id == peer_id_for_log)
+                                        {
+                                            n.auto_pair = false;
+                                        }
+                                    }
+                                    hub_rc.persist();
+                                    hub_rc.notify_frontend(&app_rc);
+                                }
+                                Err(_) => {}
+                            }
+                        });
                     }
                 }
             });

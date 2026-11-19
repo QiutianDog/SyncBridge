@@ -159,8 +159,91 @@ impl LocalEd25519Identity {
     }
 }
 
-/// Probes the OS routing table without sending any network packets to detect the primary LAN IPv4.
+fn is_cgnat_or_bench_ipv4(ip: Ipv4Addr) -> bool {
+    let oct = ip.octets();
+    // 100.64.0.0/10 (Carrier-Grade NAT / Tailscale) or 198.18.0.0/15 (Clash/Mihomo Fake-IP/TUN)
+    (oct[0] == 100 && (oct[1] & 0b1100_0000) == 64) || (oct[0] == 198 && (oct[1] == 18 || oct[1] == 19))
+}
+
+fn is_virtual_iface_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [
+        "utun",
+        "tun",
+        "tap",
+        "wg",
+        "tailscale",
+        "clash",
+        "mihomo",
+        "docker",
+        "br-",
+        "veth",
+        "vmnet",
+        "vbox",
+        "vethernet",
+        "hyper-v",
+        "wsl",
+        "awdl",
+        "llw",
+        "anpi",
+    ]
+    .iter()
+    .any(|pat| lower.contains(pat))
+}
+
+pub(crate) fn rank_lan_ipv4_candidate(iface_name: &str, ip: Ipv4Addr) -> u8 {
+    let virtual_name = is_virtual_iface_name(iface_name);
+    let rfc1918 = ip.is_private();
+    let special_tunnel = is_cgnat_or_bench_ipv4(ip) || ip.is_link_local();
+    match (rfc1918, virtual_name, special_tunnel) {
+        (true, false, false) => 0,  // Real physical Wi-Fi / Ethernet RFC1918 LAN
+        (false, false, false) => 1, // Other non-tunnel physical interface
+        (true, true, false) => 2,   // Virtual/VMware/Hyper-V RFC1918
+        _ => 3,                     // VPN TUN (198.18.x.x / 100.64.x.x) / link-local
+    }
+}
+
+/// Enumerates all UP non-loopback IPv4 interfaces `(ip, directed_broadcast)` ranked with physical
+/// RFC1918 LAN interfaces first (avoiding Clash TUN / Tailscale / virtual bridge hijacking).
+pub fn enumerate_lan_ipv4_interfaces() -> Vec<(Ipv4Addr, Ipv4Addr)> {
+    let Ok(ifaces) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+    let mut ranked: Vec<(u8, Ipv4Addr, Ipv4Addr)> = Vec::new();
+    for iface in ifaces {
+        if iface.is_loopback() {
+            continue;
+        }
+        if let if_addrs::IfAddr::V4(v4) = iface.addr {
+            let ip = v4.ip;
+            if ip.is_loopback() || ip.is_unspecified() {
+                continue;
+            }
+            let bcast = v4
+                .broadcast
+                .unwrap_or_else(|| Ipv4Addr::from(u32::from(ip) | !u32::from(v4.netmask)));
+            let rank = rank_lan_ipv4_candidate(&iface.name, ip);
+            ranked.push((rank, ip, bcast));
+        }
+    }
+    ranked.sort_by_key(|(rank, ip, _)| (*rank, u32::from(*ip)));
+    let mut out = Vec::with_capacity(ranked.len());
+    for (_, ip, bcast) in ranked {
+        if !out.iter().any(|(existing, _)| *existing == ip) {
+            out.push((ip, bcast));
+        }
+    }
+    out
+}
+
+/// Detects the primary physical LAN IPv4 address, preferring RFC1918 Wi-Fi/Ethernet NICs
+/// over VPN/Clash TUN interfaces.
 pub fn detect_local_lan_ipv4() -> Ipv4Addr {
+    let ifaces = enumerate_lan_ipv4_interfaces();
+    if let Some((best_ip, _)) = ifaces.first() {
+        return *best_ip;
+    }
+
     let probe_targets = ["192.168.1.1:80", "10.0.0.1:80", "172.16.0.1:80", "8.8.8.8:80"];
     for target in probe_targets {
         if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
@@ -175,6 +258,32 @@ pub fn detect_local_lan_ipv4() -> Ipv4Addr {
         }
     }
     Ipv4Addr::new(127, 0, 0, 1)
+}
+
+/// Binds a non-blocking UDP discovery listener with `SO_REUSEADDR` (+ `SO_REUSEPORT` on Unix)
+/// and broadcast reception enabled so quick restarts or tray background instances never lose port 24801.
+pub fn bind_lan_udp_listener(port: u16) -> std::io::Result<tokio::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    sock.set_reuse_address(true)?;
+    sock.set_broadcast(true)?;
+    sock.set_nonblocking(true)?;
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::io::AsRawFd;
+        let optval: libc::c_int = 1;
+        let _ = libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_REUSEPORT,
+            (&optval as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+    sock.bind(&addr.into())?;
+    let std_sock: UdpSocket = sock.into();
+    tokio::net::UdpSocket::from_std(std_sock)
 }
 
 pub fn detect_local_hostname() -> String {
@@ -403,7 +512,11 @@ pub async fn client_pair_spake2_over_quic(
         .map_err(|e| NetError::Transport(e.to_string()))?;
     let conn = tokio::time::timeout(Duration::from_secs(5), connecting)
         .await
-        .map_err(|_| NetError::Transport(format!("连接 {} 超时，请确认对方已打开 SpanKVM 且处于同一局域网", remote_addr)))?
+        .map_err(|_| {
+            NetError::Transport(format!(
+                "连接 {remote_addr} 超时：请确认双方处于同一局域网并放行 UDP 24800/24801（Windows 防火墙需勾选允许专用和公用网络；macOS 系统设置 → 隐私与安全性 → 本地网络需允许 SpanKVM）。也可在另一台电脑用「手动输入 IP 配对」反向连接"
+            ))
+        })?
         .map_err(|e| NetError::Transport(e.to_string()))?;
 
     let (mut send, mut recv) = conn
@@ -426,7 +539,7 @@ pub async fn client_pair_spake2_over_quic(
     write_wire_json(&mut send, &req).await?;
 
     let challenge: WireHandshakeResponse = read_wire_json(&mut recv).await?;
-    let (responder_node, resp_msg_b64, responder_confirm_hex) = match challenge {
+    let (_responder_node, resp_msg_b64, responder_confirm_hex) = match challenge {
         WireHandshakeResponse::PairSpake2Challenge {
             responder_node,
             spake2_msg_b64,
@@ -580,27 +693,47 @@ impl QuicPeerSession {
     }
 }
 
-/// Sends a UDP LAN discovery beacon to both the directed `/24` subnet broadcast address
-/// (required by macOS BSD routing) and `255.255.255.255`.
+/// Sends a UDP LAN discovery beacon out of EVERY local IPv4 interface to both its
+/// directed subnet broadcast address and `255.255.255.255`, bypassing VPN/Clash TUN hijacking.
 pub fn broadcast_lan_beacon(beacon: &LanDiscoveryBeacon, local_ip: Ipv4Addr) {
     let Ok(payload) = serde_json::to_vec(beacon) else {
         return;
     };
-    let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else {
-        return;
-    };
-    let _ = sock.set_broadcast(true);
 
-    let octets = local_ip.octets();
-    if !local_ip.is_loopback() {
-        let subnet_bcast = SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(octets[0], octets[1], octets[2], 255)),
-            DISCOVERY_UDP_PORT,
-        );
-        let _ = sock.send_to(&payload, subnet_bcast);
+    let ifaces = enumerate_lan_ipv4_interfaces();
+    let mut sent_any = false;
+
+    for (iface_ip, bcast_ip) in ifaces {
+        // Skip pure VPN TUN/CGNAT interfaces for broadcast spam unless they're the only interface
+        if is_cgnat_or_bench_ipv4(iface_ip) {
+            continue;
+        }
+        if let Ok(sock) = UdpSocket::bind(SocketAddr::new(IpAddr::V4(iface_ip), 0)) {
+            let _ = sock.set_broadcast(true);
+            let _ = sock.send_to(&payload, SocketAddr::new(IpAddr::V4(bcast_ip), DISCOVERY_UDP_PORT));
+            let _ = sock.send_to(
+                &payload,
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), DISCOVERY_UDP_PORT),
+            );
+            sent_any = true;
+        }
     }
-    let global_bcast = SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), DISCOVERY_UDP_PORT);
-    let _ = sock.send_to(&payload, global_bcast);
+
+    if !sent_any {
+        if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
+            let _ = sock.set_broadcast(true);
+            let octets = local_ip.octets();
+            if !local_ip.is_loopback() {
+                let subnet_bcast = SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(octets[0], octets[1], octets[2], 255)),
+                    DISCOVERY_UDP_PORT,
+                );
+                let _ = sock.send_to(&payload, subnet_bcast);
+            }
+            let global_bcast = SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), DISCOVERY_UDP_PORT);
+            let _ = sock.send_to(&payload, global_bcast);
+        }
+    }
 }
 
 pub fn compute_chunk_blake3_hex(bytes: &[u8]) -> String {
@@ -616,6 +749,17 @@ mod tests {
         assert!(is_lan_private_address("192.168.50.12".parse().unwrap()));
         assert!(is_lan_private_address("10.0.1.8".parse().unwrap()));
         assert!(!is_lan_private_address("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn prefers_physical_rfc1918_nic_over_clash_tun_and_tailscale() {
+        let r_wifi = rank_lan_ipv4_candidate("en0", Ipv4Addr::new(192, 168, 50, 12));
+        let r_clash = rank_lan_ipv4_candidate("utun4", Ipv4Addr::new(198, 18, 0, 1));
+        let r_tail = rank_lan_ipv4_candidate("utun3", Ipv4Addr::new(100, 64, 12, 8));
+        let r_vm = rank_lan_ipv4_candidate("vEthernet (WSL)", Ipv4Addr::new(172, 22, 0, 1));
+        assert!(r_wifi < r_vm);
+        assert!(r_vm < r_clash);
+        assert!(r_wifi < r_tail);
     }
 
     #[test]
