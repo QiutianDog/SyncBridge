@@ -455,8 +455,20 @@ test('Exclusive single-machine input suppression and lossless Snipaste/WeChat im
   assert.equal(macRs.includes('CGSetLocalEventsSuppressionInterval'), true);
   assert.equal(macRs.includes('pin_cursor_at_park'), true);
   assert.equal(macRs.includes('cancel_warp_delta'), true);
+  assert.equal(macRs.includes('debiased.signum() == drift.signum()'), true);
+  assert.equal(macRs.includes('pub fn prevent_app_nap()'), true);
+  assert.equal(macRs.includes('pthread_set_qos_class_self_np'), true);
   assert.equal(macRs.includes('is_in_edge_cooldown()'), true);
   assert.equal(macRs.includes('set_suppressing_from_hook(true)'), true);
+
+  // 1b. Tray icon & App Nap guard in src-tauri
+  const libRs = fs.readFileSync(path.join(rootDir, 'src-tauri/src/lib.rs'), 'utf-8');
+  assert.equal(libRs.includes('icons/tray-icon@2x.png'), true);
+  assert.equal(libRs.includes('.icon_as_template(cfg!(target_os = "macos"))'), true);
+  assert.equal(libRs.includes('prevent_app_nap()'), true);
+  assert.equal(fs.existsSync(path.join(rootDir, 'src-tauri/icons/tray-icon.png')), true);
+  assert.equal(fs.existsSync(path.join(rootDir, 'src-tauri/icons/tray-icon@2x.png')), true);
+  assert.equal(fs.existsSync(path.join(rootDir, 'public/favicon.svg')), true);
 
   // 2. Windows: Per-Monitor DPI v2 + immediate hook suppression + SetCursorPos warp settle + atomic modifier tracking
   const winRs = fs.readFileSync(path.join(rootDir, 'crates/spankvm-pal/src/windows.rs'), 'utf-8');

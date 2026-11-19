@@ -81,6 +81,39 @@ pub fn set_local_cursor_associated(associated: bool) {
     }
 }
 
+pub fn prevent_app_nap() {
+    #[cfg(target_os = "macos")]
+    {
+        static APP_NAP_GUARD: std::sync::Once = std::sync::Once::new();
+        APP_NAP_GUARD.call_once(|| {
+            use objc2::rc::Retained;
+            use objc2::runtime::AnyObject;
+            use objc2::{class, msg_send};
+            use objc2_foundation::NSString;
+
+            // NSActivityUserInitiatedAllowingIdleSystemSleep (0x00FF_FFFF)
+            // | NSActivityLatencyCritical (0xFF00_0000_00)
+            const OPTIONS: u64 = 0x00FF_FFFF | 0xFF00_0000_00;
+            unsafe {
+                let cls = class!(NSProcessInfo);
+                let proc_info: *mut AnyObject = msg_send![cls, processInfo];
+                if !proc_info.is_null() {
+                    let reason =
+                        NSString::from_str("SpanKVM real-time HID capture and QUIC input daemon");
+                    let token: Option<Retained<AnyObject>> = msg_send![
+                        proc_info,
+                        beginActivityWithOptions: OPTIONS,
+                        reason: &*reason
+                    ];
+                    if let Some(t) = token {
+                        std::mem::forget(t);
+                    }
+                }
+            }
+        });
+    }
+}
+
 pub struct MacOsCoreGraphicsDriver {
     pub suppressing_local: bool,
     pub cursor_pos: (f64, f64),
@@ -92,6 +125,7 @@ pub struct MacOsCoreGraphicsDriver {
 
 impl MacOsCoreGraphicsDriver {
     pub fn initialize() -> Result<Self, PalError> {
+        prevent_app_nap();
         #[cfg(target_os = "macos")]
         {
             use core_graphics::display::CGDisplay;
@@ -438,10 +472,14 @@ mod raw_tap_impl {
 
     #[inline]
     fn pin_cursor_at_park(ctx: &TapContext, park: CGPoint, prev_loc: CGPoint, record_bias: bool) {
+        let large_drift =
+            (park.x - prev_loc.x).abs() > 4.0 || (park.y - prev_loc.y).abs() > 4.0;
         if !record_bias {
             configure_zero_suppression_interval();
+            let _ = CGDisplay::associate_mouse_and_mouse_cursor_position(false);
+        } else if large_drift {
+            let _ = CGDisplay::associate_mouse_and_mouse_cursor_position(false);
         }
-        let _ = CGDisplay::associate_mouse_and_mouse_cursor_position(false);
         let _ = CGDisplay::warp_mouse_cursor_position(park);
         if record_bias {
             ctx.warp_bias.set((
@@ -466,6 +504,7 @@ mod raw_tap_impl {
 
         // Re-enable immediately if macOS temporarily disabled the tap due to timeout
         if etype == EV_TAP_DISABLED_BY_TIMEOUT || etype == EV_TAP_DISABLED_BY_USER_INPUT {
+            ctx.warp_bias.set((0, 0));
             let port = ctx.tap_port.load(Ordering::Acquire);
             if !port.is_null() {
                 CGEventTapEnable(port.cast(), true);
@@ -734,10 +773,22 @@ mod raw_tap_impl {
         }
     }
 
+    fn elevate_thread_qos_interactive() {
+        const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+        extern "C" {
+            fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+        }
+        unsafe {
+            let _ = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        }
+    }
+
     pub fn spawn(ctrl: Arc<CaptureControlState>, tx: UnboundedSender<CapturedInputEvent>) {
+        prevent_app_nap();
         std::thread::Builder::new()
             .name("spankvm-macos-eventtap".into())
             .spawn(move || {
+                elevate_thread_qos_interactive();
                 configure_zero_suppression_interval();
 
                 let event_types = [
@@ -818,10 +869,20 @@ pub(crate) fn cancel_warp_delta(raw: i32, bias: i32, drift: i32) -> i32 {
         return raw;
     }
     let debiased = raw - bias;
-    if drift == 0 && debiased.abs() <= 2 {
-        return 0;
+    if drift == 0 {
+        // Only treat as a synthetic warp echo when bias is meaningful (>= 3pt) so 1-2px micro-aiming is never lost
+        if bias.abs() >= 3 && debiased.abs() <= 2 {
+            return 0;
+        }
+        return raw;
     }
-    if (debiased - drift).abs() < (raw - drift).abs() {
+    // Direction-consistency guard: a physical move cannot point opposite to cursor drift away from park,
+    // preventing wall-clamped moves near the exit edge from reversing axis directions.
+    if bias.abs() >= 3
+        && debiased != 0
+        && debiased.signum() == drift.signum()
+        && (debiased - drift).abs() + 2 < (raw - drift).abs()
+    {
         debiased
     } else {
         raw
@@ -852,9 +913,11 @@ mod tests {
         assert_eq!(cancel_warp_delta(14, 0, 14), 14);
         assert_eq!(cancel_warp_delta(-9, 0, -9), -9);
 
-        // 2. WindowServer synthetic warp echo at park (drift == 0, raw matches bias) -> 0
+        // 2. WindowServer synthetic warp echo at park (drift == 0, bias >= 3, raw matches bias) -> 0
         assert_eq!(cancel_warp_delta(-12, -12, 0), 0);
         assert_eq!(cancel_warp_delta(8, 7, 0), 0);
+        // 1px micro-move must NOT be swallowed after 1px wall clamp
+        assert_eq!(cancel_warp_delta(-1, -1, 0), -1);
 
         // 3. WindowServer does NOT contaminate next HID delta in background -> keep raw
         assert_eq!(cancel_warp_delta(4, -5, 4), 4);
@@ -862,7 +925,9 @@ mod tests {
         // 4. WindowServer folded prior warp (-5) + small physical move (+1 -> drift +1, raw -4) -> +1
         assert_eq!(cancel_warp_delta(-4, -5, 1), 1);
 
-        // 5. Right exit-edge wall clamping: warped -1 back to w-2, user pushes right +20 (drift +1) -> +20
+        // 5. Right/top edge wall clamping: large prior warp bias (+30 / -25) MUST NEVER flip axis direction
+        assert_eq!(cancel_warp_delta(20, 30, 1), 20);
+        assert_eq!(cancel_warp_delta(-15, -25, -1), -15);
         assert_eq!(cancel_warp_delta(20, -1, 1), 20);
     }
 }

@@ -82,6 +82,7 @@ fn load_or_init_hub(app: &tauri::App) -> Arc<DaemonHub> {
 pub fn run() {
     let app = tauri::Builder::default()
         .setup(|app| {
+            spankvm_pal::macos::prevent_app_nap();
             let hub = load_or_init_hub(app);
             hub.persist();
 
@@ -197,9 +198,10 @@ pub fn run() {
                     _ => {}
                 });
 
-            if let Some(icon) = app.default_window_icon().cloned() {
-                tray_builder = tray_builder.icon(icon);
-            }
+            let tray_icon = tauri::include_image!("icons/tray-icon@2x.png");
+            let tray_builder = tray_builder
+                .icon(tray_icon)
+                .icon_as_template(cfg!(target_os = "macos"));
             let _ = tray_builder.build(handle);
 
             Ok(())
