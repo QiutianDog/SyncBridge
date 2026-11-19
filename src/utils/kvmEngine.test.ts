@@ -452,9 +452,9 @@ test('Exclusive single-machine input suppression and lossless Snipaste/WeChat im
   );
   assert.equal(macRs.includes('CGEventTapCreate('), true);
   assert.equal(macRs.includes('std::ptr::null_mut()'), true);
-  assert.equal(macRs.includes('CGEventSourceSetLocalEventsSuppressionInterval'), true);
-  assert.equal(macRs.includes('lock_cursor_at_center'), true);
-  assert.equal(macRs.includes('warp_settle_until'), true);
+  assert.equal(macRs.includes('CGSetLocalEventsSuppressionInterval'), true);
+  assert.equal(macRs.includes('pin_cursor_at_park'), true);
+  assert.equal(macRs.includes('cancel_warp_delta'), true);
   assert.equal(macRs.includes('is_in_edge_cooldown()'), true);
   assert.equal(macRs.includes('set_suppressing_from_hook(true)'), true);
 

@@ -3,10 +3,11 @@
 //! - Uses direct `ApplicationServices` C FFI for `CGEventTapCreate` so suppressed events return
 //!   `NULL` (`std::ptr::null_mut()`) directly to macOS WindowServer (working around `core-graphics`
 //!   0.24's wrapper which returns the original `CGEventRef` on `None`).
-//! - Configures `CGEventSourceSetLocalEventsSuppressionInterval(0.0)` and locks the local cursor
-//!   to the primary display center via `CGWarpMouseCursorPosition` + `CGAssociateMouseAndMouseCursorPosition(false)`
-//!   while remote control is active, ensuring Machine A's cursor and keyboard never leak locally
-//!   even when SpanKVM is in the background.
+//! - Configures zero local-event suppression interval (`CGSetLocalEventsSuppressionInterval(0.0)`)
+//!   and pins Mac's cursor motionless right at the exit screen edge (`park_pos`) via
+//!   `CGAssociateMouseAndMouseCursorPosition(false)` + immediate edge-drift pinning on `CGWarpMouseCursorPosition`,
+//!   with exact `warp_bias` cancellation so Machine A's cursor stays at the exit edge even when SpanKVM
+//!   is in the background after repeated cross-machine switches.
 //! - Automatically re-enables the tap on `kCGEventTapDisabledByTimeout` / `kCGEventTapDisabledByUserInput`.
 //! - Always honors `Ctrl + Option + Shift + Esc` emergency focus reclaim.
 
@@ -323,7 +324,7 @@ impl InputInjectorBackend for MacOsCoreGraphicsDriver {
 
 #[cfg(target_os = "macos")]
 fn configure_zero_suppression_interval() {
-    use std::ffi::c_void;
+    use std::ffi::{c_char, c_void};
     #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
         fn CGEventSourceCreate(state_id: i32) -> *mut c_void;
@@ -334,6 +335,14 @@ fn configure_zero_suppression_interval() {
         fn CFRelease(cf: *const c_void);
     }
     unsafe {
+        let sym = libc::dlsym(
+            libc::RTLD_DEFAULT,
+            b"CGSetLocalEventsSuppressionInterval\0".as_ptr() as *const c_char,
+        );
+        if !sym.is_null() {
+            let func: unsafe extern "C" fn(f64) -> i32 = std::mem::transmute(sym);
+            let _ = func(0.0);
+        }
         // kCGEventSourceStateCombinedSessionState = 0, kCGEventSourceStateHIDSystemState = 1
         for state_id in [0i32, 1i32] {
             let src = CGEventSourceCreate(state_id);
@@ -411,26 +420,37 @@ mod raw_tap_impl {
         tx: UnboundedSender<CapturedInputEvent>,
         prev_flags: Cell<u64>,
         tap_port: AtomicPtr<c_void>,
-        warp_settle_until: Cell<Option<Instant>>,
+        park_pos: Cell<CGPoint>,
+        warp_bias: Cell<(i32, i32)>,
+        edge_cross_at: Cell<Option<Instant>>,
     }
 
     #[inline]
-    fn primary_center_point() -> (CGPoint, f64, f64, f64, f64) {
+    fn primary_bounds() -> (f64, f64, f64, f64) {
         let bounds = CGDisplay::main().bounds();
-        let ox = bounds.origin.x;
-        let oy = bounds.origin.y;
-        let w = bounds.size.width.max(1.0);
-        let h = bounds.size.height.max(1.0);
-        (CGPoint::new(ox + w * 0.5, oy + h * 0.5), ox, oy, w, h)
+        (
+            bounds.origin.x,
+            bounds.origin.y,
+            bounds.size.width.max(1.0),
+            bounds.size.height.max(1.0),
+        )
     }
 
     #[inline]
-    fn lock_cursor_at_center(ctx: &TapContext) {
-        let (center, _, _, _, _) = primary_center_point();
+    fn pin_cursor_at_park(ctx: &TapContext, park: CGPoint, prev_loc: CGPoint, record_bias: bool) {
+        if !record_bias {
+            configure_zero_suppression_interval();
+        }
         let _ = CGDisplay::associate_mouse_and_mouse_cursor_position(false);
-        let _ = CGDisplay::warp_mouse_cursor_position(center);
-        ctx.warp_settle_until
-            .set(Some(Instant::now() + Duration::from_millis(65)));
+        let _ = CGDisplay::warp_mouse_cursor_position(park);
+        if record_bias {
+            ctx.warp_bias.set((
+                (park.x - prev_loc.x).round() as i32,
+                (park.y - prev_loc.y).round() as i32,
+            ));
+        } else {
+            ctx.warp_bias.set((0, 0));
+        }
     }
 
     unsafe extern "C" fn event_tap_callback(
@@ -479,7 +499,8 @@ mod raw_tap_impl {
                 && flags.contains(CGEventFlags::CGEventFlagShift)
             {
                 ctx.ctrl.set_suppressing(false);
-                ctx.warp_settle_until.set(None);
+                ctx.warp_bias.set((0, 0));
+                ctx.edge_cross_at.set(None);
                 let _ = CGDisplay::associate_mouse_and_mouse_cursor_position(true);
                 let _ = ctx.tx.send(CapturedInputEvent::EmergencyReturn);
                 return std::ptr::null_mut();
@@ -487,7 +508,8 @@ mod raw_tap_impl {
         }
 
         if !ctx.ctrl.is_suppressing() {
-            ctx.warp_settle_until.set(None);
+            ctx.warp_bias.set((0, 0));
+            ctx.edge_cross_at.set(None);
             // Local Mac currently owns focus: check if pointer hits an armed edge (respecting return cooldown)
             if !ctx.ctrl.is_in_edge_cooldown()
                 && matches!(
@@ -496,7 +518,7 @@ mod raw_tap_impl {
                 )
             {
                 let loc = CGEventGetLocation(event);
-                let (_, ox, oy, w, h) = primary_center_point();
+                let (ox, oy, w, h) = primary_bounds();
                 let rel_x = loc.x - ox;
                 let rel_y = loc.y - oy;
                 let dx = CGEventGetIntegerValueField(event, EventField::MOUSE_EVENT_DELTA_X);
@@ -519,9 +541,19 @@ mod raw_tap_impl {
                 };
 
                 if let Some((edge, target_nx, target_ny)) = crossed {
-                    // Engage suppression atomically right inside the hook so zero local events leak
+                    // Leave Mac's cursor parked visibly right at the exit edge
+                    let park = match edge {
+                        "left" => CGPoint::new(ox + 1.0, loc.y.clamp(oy + 1.0, oy + h - 2.0)),
+                        "right" => {
+                            CGPoint::new(ox + w - 2.0, loc.y.clamp(oy + 1.0, oy + h - 2.0))
+                        }
+                        "up" => CGPoint::new(loc.x.clamp(ox + 1.0, ox + w - 2.0), oy + 1.0),
+                        _ => CGPoint::new(loc.x.clamp(ox + 1.0, ox + w - 2.0), oy + h - 2.0),
+                    };
+                    ctx.park_pos.set(park);
+                    ctx.edge_cross_at.set(Some(Instant::now()));
                     ctx.ctrl.set_suppressing_from_hook(true);
-                    lock_cursor_at_center(ctx);
+                    pin_cursor_at_park(ctx, park, loc, false);
                     let _ = ctx.tx.send(CapturedInputEvent::EdgeCrossed {
                         edge,
                         norm_x: target_nx,
@@ -533,34 +565,40 @@ mod raw_tap_impl {
             return event;
         }
 
-        // Remote computer owns focus: forward events to remote AND return NULL so Mac receives NOTHING
+        // Remote computer owns focus: forward events to remote AND keep Mac cursor motionless at exit edge
         match etype {
             EV_MOUSE_MOVED
             | EV_LEFT_MOUSE_DRAGGED
             | EV_RIGHT_MOUSE_DRAGGED
             | EV_OTHER_MOUSE_DRAGGED => {
-                let dx = CGEventGetIntegerValueField(event, EventField::MOUSE_EVENT_DELTA_X) as i32;
-                let dy = CGEventGetIntegerValueField(event, EventField::MOUSE_EVENT_DELTA_Y) as i32;
+                let raw_dx =
+                    CGEventGetIntegerValueField(event, EventField::MOUSE_EVENT_DELTA_X) as i32;
+                let raw_dy =
+                    CGEventGetIntegerValueField(event, EventField::MOUSE_EVENT_DELTA_Y) as i32;
                 let loc = CGEventGetLocation(event);
-                let (center, _, _, w, h) = primary_center_point();
+                let park = ctx.park_pos.get();
+                let (_, _, w, h) = primary_bounds();
 
-                let now = Instant::now();
-                let settling = ctx
-                    .warp_settle_until
-                    .get()
-                    .map(|until| now < until)
-                    .unwrap_or(false);
+                let drift_x = (loc.x - park.x).round() as i32;
+                let drift_y = (loc.y - park.y).round() as i32;
+                let (bx, by) = ctx.warp_bias.replace((0, 0));
 
-                // Ignore huge single-packet delta spikes induced by CGWarpMouseCursorPosition edge->center jump
-                if settling && (dx.abs() as f64 > w * 0.12 || dy.abs() as f64 > h * 0.12) {
-                    return std::ptr::null_mut();
+                let dx = cancel_warp_delta(raw_dx, bx, drift_x);
+                let dy = cancel_warp_delta(raw_dy, by, drift_y);
+
+                // Re-pin cursor immediately on every move if background WindowServer let it budge off the exit edge
+                if (loc.x - park.x).abs() >= 0.5 || (loc.y - park.y).abs() >= 0.5 {
+                    pin_cursor_at_park(ctx, park, loc, true);
                 }
-                if !settling {
-                    ctx.warp_settle_until.set(None);
-                    // Only re-park cursor if OS ever let it drift noticeably from center
-                    if (loc.x - center.x).abs() > 16.0 || (loc.y - center.y).abs() > 16.0 {
-                        lock_cursor_at_center(ctx);
-                    }
+
+                let in_initial_settle = ctx
+                    .edge_cross_at
+                    .get()
+                    .map(|t| t.elapsed() < Duration::from_millis(60))
+                    .unwrap_or(false);
+                if in_initial_settle && (dx.abs() as f64 > w * 0.20 || dy.abs() as f64 > h * 0.20)
+                {
+                    return std::ptr::null_mut();
                 }
 
                 if dx != 0 || dy != 0 {
@@ -734,7 +772,9 @@ mod raw_tap_impl {
                         tx: tx.clone(),
                         prev_flags: Cell::new(0),
                         tap_port: AtomicPtr::new(std::ptr::null_mut()),
-                        warp_settle_until: Cell::new(None),
+                        park_pos: Cell::new(CGPoint::new(0.0, 0.0)),
+                        warp_bias: Cell::new((0, 0)),
+                        edge_cross_at: Cell::new(None),
                     });
                     let ctx_ptr = Box::into_raw(ctx);
 
@@ -771,6 +811,23 @@ mod raw_tap_impl {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[inline]
+pub(crate) fn cancel_warp_delta(raw: i32, bias: i32, drift: i32) -> i32 {
+    if bias == 0 {
+        return raw;
+    }
+    let debiased = raw - bias;
+    if drift == 0 && debiased.abs() <= 2 {
+        return 0;
+    }
+    if (debiased - drift).abs() < (raw - drift).abs() {
+        debiased
+    } else {
+        raw
+    }
+}
+
 pub fn spawn_macos_capture_thread(
     ctrl: Arc<CaptureControlState>,
     tx: UnboundedSender<CapturedInputEvent>,
@@ -782,5 +839,30 @@ pub fn spawn_macos_capture_thread(
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (ctrl, tx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cancel_warp_delta;
+
+    #[test]
+    fn cancel_warp_delta_strips_echo_without_dropping_motion() {
+        // 1. No pending warp bias -> untouched raw HID delta
+        assert_eq!(cancel_warp_delta(14, 0, 14), 14);
+        assert_eq!(cancel_warp_delta(-9, 0, -9), -9);
+
+        // 2. WindowServer synthetic warp echo at park (drift == 0, raw matches bias) -> 0
+        assert_eq!(cancel_warp_delta(-12, -12, 0), 0);
+        assert_eq!(cancel_warp_delta(8, 7, 0), 0);
+
+        // 3. WindowServer does NOT contaminate next HID delta in background -> keep raw
+        assert_eq!(cancel_warp_delta(4, -5, 4), 4);
+
+        // 4. WindowServer folded prior warp (-5) + small physical move (+1 -> drift +1, raw -4) -> +1
+        assert_eq!(cancel_warp_delta(-4, -5, 1), 1);
+
+        // 5. Right exit-edge wall clamping: warped -1 back to w-2, user pushes right +20 (drift +1) -> +20
+        assert_eq!(cancel_warp_delta(20, -1, 1), 20);
     }
 }
