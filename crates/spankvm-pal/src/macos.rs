@@ -358,6 +358,7 @@ mod raw_tap_impl {
     use std::cell::Cell;
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicPtr, Ordering};
+    use std::time::{Duration, Instant};
 
     const K_CG_HID_EVENT_TAP: u32 = 0;
     const K_CG_HEAD_INSERT_EVENT_TAP: u32 = 0;
@@ -410,6 +411,7 @@ mod raw_tap_impl {
         tx: UnboundedSender<CapturedInputEvent>,
         prev_flags: Cell<u64>,
         tap_port: AtomicPtr<c_void>,
+        warp_settle_until: Cell<Option<Instant>>,
     }
 
     #[inline]
@@ -423,10 +425,12 @@ mod raw_tap_impl {
     }
 
     #[inline]
-    fn lock_cursor_at_center() {
+    fn lock_cursor_at_center(ctx: &TapContext) {
         let (center, _, _, _, _) = primary_center_point();
-        let _ = CGDisplay::warp_mouse_cursor_position(center);
         let _ = CGDisplay::associate_mouse_and_mouse_cursor_position(false);
+        let _ = CGDisplay::warp_mouse_cursor_position(center);
+        ctx.warp_settle_until
+            .set(Some(Instant::now() + Duration::from_millis(65)));
     }
 
     unsafe extern "C" fn event_tap_callback(
@@ -475,6 +479,7 @@ mod raw_tap_impl {
                 && flags.contains(CGEventFlags::CGEventFlagShift)
             {
                 ctx.ctrl.set_suppressing(false);
+                ctx.warp_settle_until.set(None);
                 let _ = CGDisplay::associate_mouse_and_mouse_cursor_position(true);
                 let _ = ctx.tx.send(CapturedInputEvent::EmergencyReturn);
                 return std::ptr::null_mut();
@@ -482,11 +487,14 @@ mod raw_tap_impl {
         }
 
         if !ctx.ctrl.is_suppressing() {
-            // Local Mac currently owns focus: check if pointer hits an armed edge
-            if matches!(
-                etype,
-                EV_MOUSE_MOVED | EV_LEFT_MOUSE_DRAGGED | EV_RIGHT_MOUSE_DRAGGED
-            ) {
+            ctx.warp_settle_until.set(None);
+            // Local Mac currently owns focus: check if pointer hits an armed edge (respecting return cooldown)
+            if !ctx.ctrl.is_in_edge_cooldown()
+                && matches!(
+                    etype,
+                    EV_MOUSE_MOVED | EV_LEFT_MOUSE_DRAGGED | EV_RIGHT_MOUSE_DRAGGED
+                )
+            {
                 let loc = CGEventGetLocation(event);
                 let (_, ox, oy, w, h) = primary_center_point();
                 let rel_x = loc.x - ox;
@@ -499,13 +507,13 @@ mod raw_tap_impl {
                 let ny = (rel_y / h).clamp(0.0, 1.0) as f32;
 
                 let crossed = if rel_x <= 1.5 && dx < 0 && armed[2] {
-                    Some(("left", 0.98f32, ny))
+                    Some(("left", 0.96f32, ny))
                 } else if rel_x >= w - 2.5 && dx > 0 && armed[3] {
-                    Some(("right", 0.02f32, ny))
+                    Some(("right", 0.04f32, ny))
                 } else if rel_y <= 1.5 && dy < 0 && armed[0] {
-                    Some(("up", nx, 0.98f32))
+                    Some(("up", nx, 0.96f32))
                 } else if rel_y >= h - 2.5 && dy > 0 && armed[1] {
-                    Some(("down", nx, 0.02f32))
+                    Some(("down", nx, 0.04f32))
                 } else {
                     None
                 };
@@ -513,7 +521,7 @@ mod raw_tap_impl {
                 if let Some((edge, target_nx, target_ny)) = crossed {
                     // Engage suppression atomically right inside the hook so zero local events leak
                     ctx.ctrl.set_suppressing_from_hook(true);
-                    lock_cursor_at_center();
+                    lock_cursor_at_center(ctx);
                     let _ = ctx.tx.send(CapturedInputEvent::EdgeCrossed {
                         edge,
                         norm_x: target_nx,
@@ -533,15 +541,34 @@ mod raw_tap_impl {
             | EV_OTHER_MOUSE_DRAGGED => {
                 let dx = CGEventGetIntegerValueField(event, EventField::MOUSE_EVENT_DELTA_X) as i32;
                 let dy = CGEventGetIntegerValueField(event, EventField::MOUSE_EVENT_DELTA_Y) as i32;
-                // Keep Mac cursor locked motionless at center even when SpanKVM is in background
-                lock_cursor_at_center();
+                let loc = CGEventGetLocation(event);
+                let (center, _, _, w, h) = primary_center_point();
+
+                let now = Instant::now();
+                let settling = ctx
+                    .warp_settle_until
+                    .get()
+                    .map(|until| now < until)
+                    .unwrap_or(false);
+
+                // Ignore huge single-packet delta spikes induced by CGWarpMouseCursorPosition edge->center jump
+                if settling && (dx.abs() as f64 > w * 0.12 || dy.abs() as f64 > h * 0.12) {
+                    return std::ptr::null_mut();
+                }
+                if !settling {
+                    ctx.warp_settle_until.set(None);
+                    // Only re-park cursor if OS ever let it drift noticeably from center
+                    if (loc.x - center.x).abs() > 16.0 || (loc.y - center.y).abs() > 16.0 {
+                        lock_cursor_at_center(ctx);
+                    }
+                }
+
                 if dx != 0 || dy != 0 {
                     let _ = ctx.tx.send(CapturedInputEvent::MouseDelta { dx, dy });
                 }
                 std::ptr::null_mut()
             }
             EV_LEFT_MOUSE_DOWN => {
-                lock_cursor_at_center();
                 let _ = ctx.tx.send(CapturedInputEvent::MouseButton {
                     button: 1,
                     pressed: true,
@@ -556,7 +583,6 @@ mod raw_tap_impl {
                 std::ptr::null_mut()
             }
             EV_RIGHT_MOUSE_DOWN => {
-                lock_cursor_at_center();
                 let _ = ctx.tx.send(CapturedInputEvent::MouseButton {
                     button: 2,
                     pressed: true,
@@ -571,7 +597,6 @@ mod raw_tap_impl {
                 std::ptr::null_mut()
             }
             EV_OTHER_MOUSE_DOWN => {
-                lock_cursor_at_center();
                 let _ = ctx.tx.send(CapturedInputEvent::MouseButton {
                     button: 3,
                     pressed: true,
@@ -709,6 +734,7 @@ mod raw_tap_impl {
                         tx: tx.clone(),
                         prev_flags: Cell::new(0),
                         tap_port: AtomicPtr::new(std::ptr::null_mut()),
+                        warp_settle_until: Cell::new(None),
                     });
                     let ctx_ptr = Box::into_raw(ctx);
 

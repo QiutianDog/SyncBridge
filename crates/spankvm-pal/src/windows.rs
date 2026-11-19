@@ -274,16 +274,16 @@ mod win_hook_impl {
     use crate::keymap::canonical_from_windows_vk;
     use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
     use std::sync::OnceLock;
-    use windows::Win32::Foundation::{HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+    use windows::Win32::Foundation::{HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics,
-        SetCursorPos, SetWindowsHookExW, TranslateMessage, HHOOK, KBDLLHOOKSTRUCT, MSG,
-        MSLLHOOKSTRUCT, SM_CXSCREEN, SM_CYSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN,
-        WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK,
-        WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-        WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
-        WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP,
+        CallNextHookEx, DispatchMessageW, GetMessageW, GetSystemMetrics, SetCursorPos,
+        SetWindowsHookExW, TranslateMessage, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
+        SM_CXSCREEN, SM_CYSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP,
+        WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN,
+        WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDBLCLK,
+        WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDBLCLK,
+        WM_XBUTTONDOWN, WM_XBUTTONUP,
     };
 
     struct HookCtx {
@@ -291,6 +291,9 @@ mod win_hook_impl {
         tx: UnboundedSender<CapturedInputEvent>,
         last_x: AtomicI32,
         last_y: AtomicI32,
+        park_x: AtomicI32,
+        park_y: AtomicI32,
+        warp_settled: AtomicBool,
         ctrl_held: AtomicBool,
         alt_held: AtomicBool,
         shift_held: AtomicBool,
@@ -302,7 +305,15 @@ mod win_hook_impl {
         if code >= 0 {
             if let Some(ctx) = HOOK_CTX.get() {
                 let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-                if info.dwExtraInfo != WIN_INJECT_MAGIC && ctx.ctrl.is_daemon_enabled() {
+                if info.dwExtraInfo == WIN_INJECT_MAGIC {
+                    if wparam.0 as u32 == WM_MOUSEMOVE {
+                        ctx.last_x.store(info.pt.x, Ordering::Relaxed);
+                        ctx.last_y.store(info.pt.y, Ordering::Relaxed);
+                    }
+                    return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+                }
+
+                if ctx.ctrl.is_daemon_enabled() {
                     let msg = wparam.0 as u32;
                     let w = GetSystemMetrics(SM_CXSCREEN).max(1);
                     let h = GetSystemMetrics(SM_CYSCREEN).max(1);
@@ -311,7 +322,7 @@ mod win_hook_impl {
                         let prev_x = ctx.last_x.swap(info.pt.x, Ordering::Relaxed);
                         let prev_y = ctx.last_y.swap(info.pt.y, Ordering::Relaxed);
 
-                        if msg == WM_MOUSEMOVE {
+                        if msg == WM_MOUSEMOVE && !ctx.ctrl.is_in_edge_cooldown() {
                             let dx = info.pt.x - prev_x;
                             let dy = info.pt.y - prev_y;
                             let armed = ctx.ctrl.armed_edges();
@@ -319,21 +330,24 @@ mod win_hook_impl {
                             let ny = (info.pt.y as f32 / h as f32).clamp(0.0, 1.0);
 
                             let crossed = if info.pt.x <= 1 && dx < 0 && armed[2] {
-                                Some(("left", 0.98f32, ny))
+                                Some(("left", 0.96f32, ny))
                             } else if info.pt.x >= w - 2 && dx > 0 && armed[3] {
-                                Some(("right", 0.02f32, ny))
+                                Some(("right", 0.04f32, ny))
                             } else if info.pt.y <= 1 && dy < 0 && armed[0] {
-                                Some(("up", nx, 0.98f32))
+                                Some(("up", nx, 0.96f32))
                             } else if info.pt.y >= h - 2 && dy > 0 && armed[1] {
-                                Some(("down", nx, 0.02f32))
+                                Some(("down", nx, 0.04f32))
                             } else {
                                 None
                             };
 
                             if let Some((edge, target_nx, target_ny)) = crossed {
-                                ctx.ctrl.set_suppressing_from_hook(true);
                                 let cx = w / 2;
                                 let cy = h / 2;
+                                ctx.park_x.store(cx, Ordering::Release);
+                                ctx.park_y.store(cy, Ordering::Release);
+                                ctx.warp_settled.store(false, Ordering::Release);
+                                ctx.ctrl.set_suppressing_from_hook(true);
                                 let _ = SetCursorPos(cx, cy);
                                 ctx.last_x.store(cx, Ordering::Relaxed);
                                 ctx.last_y.store(cy, Ordering::Relaxed);
@@ -348,11 +362,28 @@ mod win_hook_impl {
                     } else {
                         match msg {
                             WM_MOUSEMOVE => {
-                                let mut cur = POINT::default();
-                                let _ = GetCursorPos(&mut cur);
-                                let dx = info.pt.x - cur.x;
-                                let dy = info.pt.y - cur.y;
-                                // Ignore synthetic warp event matching exact parked center
+                                let cx = ctx.park_x.load(Ordering::Acquire);
+                                let cy = ctx.park_y.load(Ordering::Acquire);
+                                let dx = info.pt.x - cx;
+                                let dy = info.pt.y - cy;
+
+                                if !ctx.warp_settled.load(Ordering::Acquire) {
+                                    // Wait until SetCursorPos(cx, cy) takes effect; never forward edge->center warp delta
+                                    if dx.abs() <= 160 && dy.abs() <= 160 {
+                                        ctx.warp_settled.store(true, Ordering::Release);
+                                    } else {
+                                        let _ = SetCursorPos(cx, cy);
+                                    }
+                                    return LRESULT(1);
+                                }
+
+                                // Sanity check: if another app warped cursor away, re-park instead of sending giant spike
+                                if dx.abs() > (w / 3).max(200) || dy.abs() > (h / 3).max(200) {
+                                    ctx.warp_settled.store(false, Ordering::Release);
+                                    let _ = SetCursorPos(cx, cy);
+                                    return LRESULT(1);
+                                }
+
                                 if dx != 0 || dy != 0 {
                                     let _ = ctx.tx.send(CapturedInputEvent::MouseDelta { dx, dy });
                                 }
@@ -485,6 +516,9 @@ mod win_hook_impl {
             tx,
             last_x: AtomicI32::new(500),
             last_y: AtomicI32::new(500),
+            park_x: AtomicI32::new(500),
+            park_y: AtomicI32::new(500),
+            warp_settled: AtomicBool::new(true),
             ctrl_held: AtomicBool::new(false),
             alt_held: AtomicBool::new(false),
             shift_held: AtomicBool::new(false),

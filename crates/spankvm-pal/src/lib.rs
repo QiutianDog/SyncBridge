@@ -12,11 +12,18 @@ pub mod linux_wayland;
 pub mod macos;
 pub mod windows;
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 use spankvm_proto::{LinuxWaylandStrategy, OsKind, Resolution};
 use thiserror::Error;
 use tokio::sync::mpsc::UnboundedSender;
+
+fn monotonic_ms() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let start = EPOCH.get_or_init(Instant::now);
+    start.elapsed().as_millis() as u64
+}
 
 pub const SPANKVM_INJECT_MAGIC: i64 = 0x5350_4B56_4D31;
 
@@ -72,6 +79,7 @@ pub struct CaptureControlState {
     suppressing_local: AtomicBool,
     /// Bitmask: bit0=up, bit1=down, bit2=left, bit3=right
     armed_edges_mask: AtomicU8,
+    edge_cooldown_until_ms: AtomicU64,
 }
 
 impl CaptureControlState {
@@ -80,6 +88,7 @@ impl CaptureControlState {
             daemon_enabled: AtomicBool::new(daemon_enabled),
             suppressing_local: AtomicBool::new(false),
             armed_edges_mask: AtomicU8::new(0),
+            edge_cooldown_until_ms: AtomicU64::new(0),
         }
     }
 
@@ -101,8 +110,22 @@ impl CaptureControlState {
     }
 
     pub fn set_suppressing(&self, suppress: bool) {
-        self.suppressing_local.store(suppress, Ordering::Release);
+        let was = self.suppressing_local.swap(suppress, Ordering::Release);
+        if !suppress && was {
+            self.arm_edge_cooldown_ms(100);
+        }
         macos::set_local_cursor_associated(!suppress);
+    }
+
+    #[inline]
+    pub fn arm_edge_cooldown_ms(&self, duration_ms: u64) {
+        let target = monotonic_ms().saturating_add(duration_ms);
+        self.edge_cooldown_until_ms.store(target, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn is_in_edge_cooldown(&self) -> bool {
+        monotonic_ms() < self.edge_cooldown_until_ms.load(Ordering::Acquire)
     }
 
     /// Called directly inside real-time OS input hook callbacks the instant the pointer crosses an armed edge,

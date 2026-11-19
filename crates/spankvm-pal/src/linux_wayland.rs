@@ -407,6 +407,7 @@ pub fn spawn_linux_capture_thread(
 
                 let mut prev_pos: Option<(i16, i16)> = None;
                 let mut x11_grabbed = false;
+                let mut warp_settling = false;
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(4));
                     if !ctrl.is_daemon_enabled() {
@@ -417,6 +418,7 @@ pub fn spawn_linux_capture_thread(
                             x11_grabbed = false;
                         }
                         prev_pos = None;
+                        warp_settling = false;
                         continue;
                     }
 
@@ -448,6 +450,7 @@ pub fn spawn_linux_capture_thread(
                         let _ = conn.ungrab_keyboard(x11rb::CURRENT_TIME);
                         let _ = conn.flush();
                         x11_grabbed = false;
+                        warp_settling = false;
                     }
 
                     let Ok(cookie) = conn.query_pointer(root) else {
@@ -464,43 +467,73 @@ pub fn spawn_linux_capture_thread(
                     let dy = (cy - py) as i32;
 
                     if !suppressing {
-                        let armed = ctrl.armed_edges();
-                        let nx = (cx as f32 / w.max(1) as f32).clamp(0.0, 1.0);
-                        let ny = (cy as f32 / h.max(1) as f32).clamp(0.0, 1.0);
+                        warp_settling = false;
+                        if !ctrl.is_in_edge_cooldown() {
+                            let armed = ctrl.armed_edges();
+                            let nx = (cx as f32 / w.max(1) as f32).clamp(0.0, 1.0);
+                            let ny = (cy as f32 / h.max(1) as f32).clamp(0.0, 1.0);
 
-                        let crossed = if cx <= 1 && dx < 0 && armed[2] {
-                            Some(("left", 0.98f32, ny))
-                        } else if cx as i32 >= w - 2 && dx > 0 && armed[3] {
-                            Some(("right", 0.02f32, ny))
-                        } else if cy <= 1 && dy < 0 && armed[0] {
-                            Some(("up", nx, 0.98f32))
-                        } else if cy as i32 >= h - 2 && dy > 0 && armed[1] {
-                            Some(("down", nx, 0.02f32))
-                        } else {
-                            None
-                        };
+                            let crossed = if cx <= 1 && dx < 0 && armed[2] {
+                                Some(("left", 0.96f32, ny))
+                            } else if cx as i32 >= w - 2 && dx > 0 && armed[3] {
+                                Some(("right", 0.04f32, ny))
+                            } else if cy <= 1 && dy < 0 && armed[0] {
+                                Some(("up", nx, 0.96f32))
+                            } else if cy as i32 >= h - 2 && dy > 0 && armed[1] {
+                                Some(("down", nx, 0.04f32))
+                            } else {
+                                None
+                            };
 
-                        if let Some((edge, target_nx, target_ny)) = crossed {
-                            ctrl.set_suppressing_from_hook(true);
-                            let center_x = (w / 2) as i16;
-                            let center_y = (h / 2) as i16;
-                            let _ =
-                                conn.warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, center_x, center_y);
-                            let _ = conn.flush();
-                            prev_pos = Some((center_x, center_y));
-                            let _ = tx.send(CapturedInputEvent::EdgeCrossed {
-                                edge,
-                                norm_x: target_nx,
-                                norm_y: target_ny,
-                            });
+                            if let Some((edge, target_nx, target_ny)) = crossed {
+                                ctrl.set_suppressing_from_hook(true);
+                                warp_settling = true;
+                                let center_x = (w / 2) as i16;
+                                let center_y = (h / 2) as i16;
+                                let _ = conn.warp_pointer(
+                                    x11rb::NONE,
+                                    root,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    center_x,
+                                    center_y,
+                                );
+                                let _ = conn.flush();
+                                prev_pos = Some((center_x, center_y));
+                                let _ = tx.send(CapturedInputEvent::EdgeCrossed {
+                                    edge,
+                                    norm_x: target_nx,
+                                    norm_y: target_ny,
+                                });
+                            }
                         }
-                    } else if dx != 0 || dy != 0 {
-                        let _ = tx.send(CapturedInputEvent::MouseDelta { dx, dy });
+                    } else {
                         let center_x = (w / 2) as i16;
                         let center_y = (h / 2) as i16;
-                        let _ = conn.warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, center_x, center_y);
-                        let _ = conn.flush();
-                        prev_pos = Some((center_x, center_y));
+                        if warp_settling {
+                            if (cx - center_x).abs() <= 160 && (cy - center_y).abs() <= 160 {
+                                warp_settling = false;
+                                prev_pos = Some((center_x, center_y));
+                            }
+                            continue;
+                        }
+                        if dx != 0 || dy != 0 {
+                            let _ = tx.send(CapturedInputEvent::MouseDelta { dx, dy });
+                            let _ = conn.warp_pointer(
+                                x11rb::NONE,
+                                root,
+                                0,
+                                0,
+                                0,
+                                0,
+                                center_x,
+                                center_y,
+                            );
+                            let _ = conn.flush();
+                            prev_pos = Some((center_x, center_y));
+                        }
                     }
                 }
             })

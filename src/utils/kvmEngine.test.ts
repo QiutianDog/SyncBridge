@@ -454,12 +454,15 @@ test('Exclusive single-machine input suppression and lossless Snipaste/WeChat im
   assert.equal(macRs.includes('std::ptr::null_mut()'), true);
   assert.equal(macRs.includes('CGEventSourceSetLocalEventsSuppressionInterval'), true);
   assert.equal(macRs.includes('lock_cursor_at_center'), true);
+  assert.equal(macRs.includes('warp_settle_until'), true);
+  assert.equal(macRs.includes('is_in_edge_cooldown()'), true);
   assert.equal(macRs.includes('set_suppressing_from_hook(true)'), true);
 
-  // 2. Windows: Per-Monitor DPI v2 + immediate hook suppression + atomic modifier tracking
+  // 2. Windows: Per-Monitor DPI v2 + immediate hook suppression + SetCursorPos warp settle + atomic modifier tracking
   const winRs = fs.readFileSync(path.join(rootDir, 'crates/spankvm-pal/src/windows.rs'), 'utf-8');
   assert.equal(winRs.includes('DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2'), true);
   assert.equal(winRs.includes('set_suppressing_from_hook(true)'), true);
+  assert.equal(winRs.includes('warp_settled: AtomicBool'), true);
   assert.equal(winRs.includes('LRESULT(1)'), true);
   assert.equal(winRs.includes('ctrl_held: AtomicBool'), true);
 
@@ -476,6 +479,9 @@ test('Exclusive single-machine input suppression and lossless Snipaste/WeChat im
   assert.equal(runtimeRs.includes('ClipboardSnapshot::Image'), true);
   assert.equal(runtimeRs.includes('write_os_clipboard_png_or_rgba('), true);
   assert.equal(runtimeRs.includes('os_clipboard_sequence_token()'), true);
+  assert.equal(runtimeRs.includes('last_edge_cross_at'), true);
+  assert.equal(runtimeRs.includes('arm_edge_cooldown_ms(120)'), true);
 });
+
 
 

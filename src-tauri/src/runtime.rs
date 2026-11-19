@@ -4,7 +4,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 use spankvm_core::{compute_neighbors, find_next_adjacent_slot, resolve_mapped_key};
@@ -419,8 +419,9 @@ pub fn start_background_services(hub: Arc<DaemonHub>, app_handle: AppHandle) {
         });
 
         // 4. Real-Time Captured Input Event Router Loop
+        let mut last_edge_cross_at: Option<Instant> = None;
         while let Some(ev) = cap_rx.recv().await {
-            handle_captured_local_input(&hub, &app_handle, ev).await;
+            handle_captured_local_input(&hub, &app_handle, &mut last_edge_cross_at, ev).await;
         }
     });
 }
@@ -428,10 +429,12 @@ pub fn start_background_services(hub: Arc<DaemonHub>, app_handle: AppHandle) {
 async fn handle_captured_local_input(
     hub: &Arc<DaemonHub>,
     app_handle: &AppHandle,
+    last_edge_cross_at: &mut Option<Instant>,
     ev: CapturedInputEvent,
 ) {
     match ev {
         CapturedInputEvent::EmergencyReturn => {
+            *last_edge_cross_at = None;
             hub.capture_ctrl.set_suppressing(false);
             if let Ok(mut guard) = hub.state.write() {
                 let local_id = guard.data.local_node_id.clone();
@@ -526,6 +529,7 @@ async fn handle_captured_local_input(
 
             match decision {
                 HandoffDecision::Proceed(sess, target_id) => {
+                    *last_edge_cross_at = Some(Instant::now());
                     hub.capture_ctrl.set_suppressing(true);
                     let frame = ReliableControlFrame::FocusEnter {
                         node_id: target_id,
@@ -533,6 +537,7 @@ async fn handle_captured_local_input(
                         normalized_y: norm_y,
                     };
                     if sess.send_reliable_frame(&frame, true).await.is_err() {
+                        *last_edge_cross_at = None;
                         hub.capture_ctrl.set_suppressing(false);
                         if let Ok(mut guard) = hub.state.write() {
                             let local_id = guard.data.local_node_id.clone();
@@ -551,6 +556,13 @@ async fn handle_captured_local_input(
         }
 
         CapturedInputEvent::MouseDelta { dx, dy } => {
+            if let Some(entered_at) = *last_edge_cross_at {
+                if entered_at.elapsed() < Duration::from_millis(75)
+                    && (dx.abs() > 300 || dy.abs() > 300)
+                {
+                    return;
+                }
+            }
             enum DeltaAction {
                 SendFast(QuicPeerSession, FastPointerDatagram),
                 ReturnLocal {
@@ -635,12 +647,10 @@ async fn handle_captured_local_input(
                     };
                     DeltaAction::SendFast(sess, dgram)
                 } else {
-                    DeltaAction::ReturnLocal {
-                        prev_sess: None,
-                        release_keys: Vec::new(),
-                        nx: 0.5,
-                        ny: 0.5,
+                    if hub.capture_ctrl.is_suppressing() {
+                        hub.capture_ctrl.set_suppressing(false);
                     }
+                    DeltaAction::None
                 }
             };
 
@@ -1154,6 +1164,7 @@ fn process_incoming_reliable_frame(
             ..
         } => {
             hub.capture_ctrl.set_suppressing(false);
+            hub.capture_ctrl.arm_edge_cooldown_ms(120);
             if let Ok(mut guard) = hub.state.write() {
                 let local_id = guard.data.local_node_id.clone();
                 guard.cursor.active_node_id = local_id.clone();
